@@ -1421,7 +1421,7 @@ function showToast(msg){const t=document.getElementById('toast');document.getEle
 function hideToast(){document.getElementById('toast').style.display='none';}
 function showErr(msg){const b=document.getElementById('err-banner');document.getElementById('err-msg').textContent=msg;b.style.display='flex';}
 function hideErr(){document.getElementById('err-banner').style.display='none';}
-function dismissIntro(){document.getElementById('intro').classList.add('hidden');}
+function dismissIntro(){var el=document.getElementById('intro');if(el){el.style.display='none';}}
 function showIntro(){document.getElementById('intro').classList.remove('hidden');}
 
 // ── TABS ───────────────────────────────────────────────────────────────────────
