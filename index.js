@@ -3,259 +3,521 @@ const { google } = require("googleapis");
 const app = express();
 app.use(express.json());
 
+// ─── CONFIG ───────────────────────────────────────────────────────────────────
 const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
 const GOOGLE_ID     = process.env.GOOGLE_CLIENT_ID;
 const GOOGLE_SECRET = process.env.GOOGLE_CLIENT_SECRET;
-const BASE_URL      = process.env.BASE_URL;
+const BASE_URL      = process.env.BASE_URL; // e.g. https://your-app.railway.app
 const PORT          = process.env.PORT || 3001;
 
+// ─── STATE (use a DB in production) ──────────────────────────────────────────
 let gmailTokens   = null;
 let processedIds  = new Set();
-let pendingReview = [];
-let sendQueue     = [];
-let sentLog       = [];
+let pendingReview = [];       // held for human review
+let sendQueue     = [];       // scheduled to auto-send after delay
+let sentLog       = [];       // full log of every sent email
 let activityLog   = [];
-let archiveEmails = [];
-let notifications = [];
-let crmContacts   = [];
-
-let voiceProfile = {
-  samples: [],
-  guidelines: [
-    "- Always greet by first name if known",
-    "- Keep replies under 4 sentences for simple emails",
-    "- Never make clinical promises or give medical advice",
-    "- Always offer a next step (call, book online, reply back)",
-    '- Sign off as "Expert Physio Team"',
-    "- Tone: warm, professional, never robotic",
-    "- For cancellations: express understanding, offer rebooking",
-    "- For new patients: welcoming, mention direct billing where applicable",
-    "- For ICBC: acknowledge only, never promise outcomes"
-  ].join("\n"),
+let voiceProfile  = {         // Expert Physio's voice — editable from dashboard
+  samples: [],                // approved reply samples
+  guidelines: `
+- Always greet by first name if known
+- Keep replies under 4 sentences for simple emails
+- Never make clinical promises or give medical advice
+- Always offer a next step (call, book online, reply back)
+- Sign off as "Expert Physio Team"
+- Tone: warm, professional, never robotic
+- For cancellations: express understanding, offer rebooking
+- For new patients: welcoming, mention direct billing where applicable
+- For ICBC: acknowledge only, never promise outcomes
+`.trim(),
 };
 
-const CRM_STATUSES = {
-  ACTIVE: "active", SILENT: "silent", FOLLOWUP: "followup",
-  BOOKED: "booked", LOST: "lost", OPTED_OUT: "opted_out",
-};
-
-const SEND_DELAY_MS  = 5 * 60 * 1000;
-const OLD_EMAIL_DAYS = 3;
-const CONFIDENCE_MIN = 80;
-const FOLLOW_UP_DAYS = 14;
-
+// ─── LOGGING ──────────────────────────────────────────────────────────────────
 function log(msg, type = "info") {
   const time = new Date().toLocaleTimeString("en-CA", { hour: "2-digit", minute: "2-digit" });
-  activityLog.unshift({ time, msg, type });
+  const entry = { time, msg, type };
+  activityLog.unshift(entry);
   if (activityLog.length > 200) activityLog.pop();
-  console.log("[" + time + "] [" + type.toUpperCase() + "] " + msg);
+  console.log(`[${time}] [${type.toUpperCase()}] ${msg}`);
 }
 
-function isOldEmail(email) {
-  if (!email.date) return false;
-  return (Date.now() - new Date(email.date).getTime()) > OLD_EMAIL_DAYS * 86400000;
-}
-
-function detectLostSignal(body) {
-  const b = (body || "").toLowerCase();
-  return ["found another","going with another","no longer need","cancel my","not interested",
-    "please remove","don't contact","stop emailing","found a physio","booked elsewhere"].some(p => b.includes(p));
-}
-
-function upsertCRM(email, name, subject) {
-  const existing = crmContacts.find(c => c.email.toLowerCase() === email.toLowerCase());
-  if (existing) {
-    existing.lastSeen = new Date().toISOString();
-    existing.lastSubject = subject;
-    existing.touchCount = (existing.touchCount || 0) + 1;
-    if (existing.status === CRM_STATUSES.SILENT) existing.status = CRM_STATUSES.ACTIVE;
-    return existing;
-  }
-  const c = {
-    id: "crm_" + Date.now() + "_" + Math.random().toString(36).slice(2,7),
-    email, name: name || email.split("@")[0],
-    firstSeen: new Date().toISOString(), lastSeen: new Date().toISOString(),
-    lastSubject: subject, touchCount: 1, status: CRM_STATUSES.ACTIVE,
-    notes: "", followUpCount: 0, followUpScheduled: false,
-  };
-  crmContacts.unshift(c);
-  if (crmContacts.length > 1000) crmContacts.pop();
-  return c;
-}
-
-async function callAI(userMsg, systemMsg, jsonMode) {
+// ─── ANTHROPIC AI ─────────────────────────────────────────────────────────────
+async function callAI(userMsg, systemMsg, jsonMode = false) {
   const system = jsonMode
-    ? systemMsg + "\n\nCRITICAL: Respond ONLY with valid JSON. No markdown, no explanation."
+    ? systemMsg + "\n\nCRITICAL: Respond ONLY with a valid JSON object. No markdown fences, no explanation."
     : systemMsg;
   const res = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
-    headers: { "Content-Type": "application/json", "x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01" },
-    body: JSON.stringify({ model: "claude-sonnet-4-6", max_tokens: 1200, system, messages: [{ role: "user", content: userMsg }] }),
+    headers: {
+      "Content-Type": "application/json",
+      "x-api-key": ANTHROPIC_KEY,
+      "anthropic-version": "2023-06-01",
+    },
+    body: JSON.stringify({
+      model: "claude-sonnet-4-6",
+      max_tokens: 1200,
+      system,
+      messages: [{ role: "user", content: userMsg }],
+    }),
   });
-  if (!res.ok) throw new Error("AI error " + res.status);
+  if (!res.ok) {
+    const e = await res.json().catch(() => ({}));
+    throw new Error(e?.error?.message || `AI API error ${res.status}`);
+  }
   const data = await res.json();
-  return (data.content || []).filter(b => b.type === "text").map(b => b.text).join("\n").trim();
+  const text = (data.content || []).filter(b => b.type === "text").map(b => b.text).join("\n").trim();
+  if (!text) throw new Error("Empty AI response");
+  return text;
 }
 
 function parseJSON(raw) {
   const clean = raw.replace(/^```(?:json)?\s*/i, "").replace(/\s*```\s*$/m, "").trim();
-  try { return JSON.parse(clean); } catch { const m = clean.match(/\{[\s\S]*\}/); if (m) return JSON.parse(m[0]); throw new Error("JSON parse failed"); }
+  try { return JSON.parse(clean); }
+  catch { const m = clean.match(/\{[\s\S]*\}/); if (m) return JSON.parse(m[0]); throw new Error("JSON parse failed"); }
 }
 
-function getOAuth() { return new google.auth.OAuth2(GOOGLE_ID, GOOGLE_SECRET, BASE_URL + "/auth/callback"); }
+// ─── GMAIL ────────────────────────────────────────────────────────────────────
+function getOAuthClient() {
+  return new google.auth.OAuth2(GOOGLE_ID, GOOGLE_SECRET, `${BASE_URL}/auth/callback`);
+}
 
 function getGmail() {
   if (!gmailTokens) throw new Error("Gmail not connected");
-  const auth = getOAuth();
+  const auth = getOAuthClient();
   auth.setCredentials(gmailTokens);
-  auth.on("tokens", t => { if (t.refresh_token) gmailTokens.refresh_token = t.refresh_token; gmailTokens.access_token = t.access_token; });
+  auth.on("tokens", t => {
+    if (t.refresh_token) gmailTokens.refresh_token = t.refresh_token;
+    gmailTokens.access_token = t.access_token;
+  });
   return google.gmail({ version: "v1", auth });
 }
 
 async function fetchUnread() {
-  const r = await getGmail().users.messages.list({ userId: "me", q: "is:unread in:inbox", maxResults: 25 });
-  return r.data.messages || [];
+  const gmail = getGmail();
+  const res = await gmail.users.messages.list({ userId: "me", q: "is:unread in:inbox", maxResults: 25 });
+  return res.data.messages || [];
 }
 
 async function getEmailDetails(id) {
-  const r = await getGmail().users.messages.get({ userId: "me", id, format: "full" });
-  const hdr = r.data.payload.headers;
-  const get = n => (hdr.find(h => h.name.toLowerCase() === n) || {}).value || "";
+  const gmail = getGmail();
+  const res = await gmail.users.messages.get({ userId: "me", id, format: "full" });
+  const msg = res.data;
+  const hdr = msg.payload.headers;
+  const get = name => hdr.find(h => h.name.toLowerCase() === name)?.value || "";
   let body = "";
-  const walk = p => {
-    if (p.mimeType === "text/plain" && p.body && p.body.data) body = Buffer.from(p.body.data, "base64").toString("utf-8");
-    else if (p.parts) p.parts.forEach(walk);
+  const walk = part => {
+    if (part.mimeType === "text/plain" && part.body?.data)
+      body = Buffer.from(part.body.data, "base64").toString("utf-8");
+    else if (part.parts) part.parts.forEach(walk);
   };
-  walk(r.data.payload);
-  return { id, threadId: r.data.threadId, from: get("from"), to: get("to"), subject: get("subject"), body: body.trim().slice(0, 2500), date: get("date") };
+  walk(msg.payload);
+  return {
+    id,
+    threadId: msg.threadId,
+    from: get("from"),
+    to: get("to"),
+    subject: get("subject"),
+    body: body.trim().slice(0, 2500),
+    date: get("date"),
+  };
 }
 
-async function markRead(id) { await getGmail().users.messages.modify({ userId: "me", id, requestBody: { removeLabelIds: ["UNREAD"] } }); }
+async function markRead(id) {
+  const gmail = getGmail();
+  await gmail.users.messages.modify({ userId: "me", id, requestBody: { removeLabelIds: ["UNREAD"] } });
+}
 
 async function sendEmail(threadId, to, subject, body) {
-  const subj = subject.startsWith("Re:") ? subject : "Re: " + subject;
-  const raw = Buffer.from(["To: " + to, "Subject: " + subj, 'Content-Type: text/plain; charset="UTF-8"', "", body].join("\r\n")).toString("base64").replace(/\+/g, "-").replace(/\//g, "_");
-  await getGmail().users.messages.send({ userId: "me", requestBody: { raw, threadId } });
+  const gmail = getGmail();
+  const subj = subject.startsWith("Re:") ? subject : `Re: ${subject}`;
+  const raw = Buffer.from(
+    [`To: ${to}`, `Subject: ${subj}`, `Content-Type: text/plain; charset="UTF-8"`, ``, body].join("\r\n")
+  ).toString("base64").replace(/\+/g, "-").replace(/\//g, "_");
+  await gmail.users.messages.send({ userId: "me", requestBody: { raw, threadId } });
 }
 
 async function applyLabel(id, name) {
-  const list = await getGmail().users.labels.list({ userId: "me" });
-  let label = (list.data.labels || []).find(l => l.name === name);
+  const gmail = getGmail();
+  const list = await gmail.users.labels.list({ userId: "me" });
+  let label = list.data.labels.find(l => l.name === name);
   if (!label) {
-    const c = await getGmail().users.labels.create({ userId: "me", requestBody: { name, labelListVisibility: "labelShow", messageListVisibility: "show" } });
+    const c = await gmail.users.labels.create({
+      userId: "me",
+      requestBody: { name, labelListVisibility: "labelShow", messageListVisibility: "show" },
+    });
     label = c.data;
   }
-  await getGmail().users.messages.modify({ userId: "me", id, requestBody: { addLabelIds: [label.id] } });
+  await gmail.users.messages.modify({ userId: "me", id, requestBody: { addLabelIds: [label.id] } });
 }
 
+// ─── OAUTH ROUTES ─────────────────────────────────────────────────────────────
 app.get("/auth/login", (req, res) => {
-  const url = getOAuth().generateAuthUrl({ access_type: "offline", prompt: "consent", scope: ["https://www.googleapis.com/auth/gmail.readonly","https://www.googleapis.com/auth/gmail.send","https://www.googleapis.com/auth/gmail.modify"] });
+  const auth = getOAuthClient();
+  const url = auth.generateAuthUrl({
+    access_type: "offline", prompt: "consent",
+    scope: [
+      "https://www.googleapis.com/auth/gmail.readonly",
+      "https://www.googleapis.com/auth/gmail.send",
+      "https://www.googleapis.com/auth/gmail.modify",
+    ],
+  });
   res.redirect(url);
 });
 
 app.get("/auth/callback", async (req, res) => {
   try {
-    const { tokens } = await getOAuth().getToken(req.query.code);
+    const auth = getOAuthClient();
+    const { tokens } = await auth.getToken(req.query.code);
     gmailTokens = tokens;
     log("Gmail connected — autopilot started", "success");
     startPolling();
     res.redirect("/?connected=1");
-  } catch (err) { log("OAuth error: " + err.message, "error"); res.status(500).send("Auth failed: " + err.message); }
+  } catch (err) {
+    log("OAuth error: " + err.message, "error");
+    res.status(500).send("Authentication failed: " + err.message);
+  }
 });
 
+// ─── CLASSIFICATION + CONFIDENCE SCORING ──────────────────────────────────────
+/*
+  Returns:
+  {
+    category: "cancellation" | "new-patient" | "billing" | "referral" | "icbc" | "complaint" | "other",
+    autoSend: true | false,
+    confidence: 0-100,        // how sure the AI is
+    reason: "string",         // why it made this decision
+    urgency: "normal" | "high"
+  }
+
+  autoSend = true ONLY when:
+  - category is cancellation, new-patient, billing, or referral
+  - confidence >= 80
+  - No clinical claims, legal risk, or ambiguity detected
+*/
 async function classify(email) {
+  const voiceContext = voiceProfile.samples.length > 0
+    ? `\n\nVoice samples from this clinic:\n${voiceProfile.samples.slice(0, 3).join("\n---\n")}`
+    : "";
+
   const raw = await callAI(
-    "Classify this physiotherapy clinic email.\n\nFrom: " + email.from + "\nSubject: " + email.subject + "\nBody: " + email.body + '\n\nReturn JSON:\n{"category":"cancellation|new-patient|billing|referral|icbc|complaint|other","autoSend":true_or_false,"confidence":0_to_100,"reason":"one sentence","urgency":"normal|high","extractedName":"first name or null"}\n\nAutoSend=true ONLY if: category is cancellation/new-patient/billing/referral AND confidence>=80 AND no clinical questions AND no legal risk AND no ICBC AND no complaints.',
-    "You are a clinical email triage system. Be conservative — when in doubt set autoSend to false.", true
-  );
-  try { return parseJSON(raw); } catch { return { category: "other", autoSend: false, confidence: 0, reason: "Classification failed", urgency: "normal", extractedName: null }; }
+    `Classify this physiotherapy clinic email and determine if it is safe to auto-reply without human review.
+
+From: ${email.from}
+Subject: ${email.subject}
+Body: ${email.body}
+
+Return JSON with these exact keys:
+{
+  "category": "cancellation|new-patient|billing|referral|icbc|complaint|other",
+  "autoSend": true or false,
+  "confidence": 0-100,
+  "reason": "one sentence explaining your decision",
+  "urgency": "normal|high",
+  "extractedName": "patient first name if found, else null"
 }
+
+Auto-send rules — set autoSend to TRUE only if ALL of these are true:
+1. Category is one of: cancellation, new-patient, billing, referral
+2. Confidence is 80 or above
+3. No clinical questions requiring a therapist's judgment
+4. No legal risk, complaints, or expressions of dissatisfaction
+5. No ICBC claim numbers or authorization requests
+6. No requests for specific appointment times (those need schedule access)
+
+Set autoSend to FALSE for: ICBC, complaints, anything ambiguous, anything requiring clinical judgment, anything with legal implications.${voiceContext}`,
+    "You are a clinical email triage system for a physiotherapy clinic. Be conservative — when in doubt, set autoSend to false. Patient safety and clinic reputation come first.",
+    true
+  );
+
+  try {
+    return parseJSON(raw);
+  } catch {
+    return { category: "other", autoSend: false, confidence: 0, reason: "Classification failed", urgency: "normal", extractedName: null };
+  }
+}
+
+// ─── REPLY GENERATION WITH VOICE MATCHING ────────────────────────────────────
+const REPLY_TEMPLATES = {
+  cancellation: (name) => `Thank you for letting us know, ${name || ""}. We completely understand that things come up! We'd love to find a new time that works for you — please reply with a few days and times that suit you, or give us a call and we'll get you rebooked right away.`,
+  "new-patient": (name) => `Hi ${name || "there"}, thank you for reaching out to Expert Physio! We'd be happy to welcome you as a new patient. We do direct bill to most major insurance providers. To book your initial assessment, please call us or reply with your availability and we'll find a time that works for you.`,
+  billing: (name) => `Hi ${name || "there"}, thank you for getting in touch about your account. Our admin team will look into this and follow up with you within 1-2 business days. If you have your insurance policy number handy, please include it in your reply to help us process this faster.`,
+  referral: (name) => `Thank you for the referral. We've received your note and will be in touch with the patient within 2 business days to schedule their initial assessment. Please don't hesitate to reach out if you need anything in the meantime.`,
+  other: (name) => `Hi ${name || "there"}, thank you for your message. A member of our team will review this and get back to you within 1-2 business days.`,
+};
+
+async function generateReply(email, classification) {
+  const { category, extractedName } = classification;
+  const name = extractedName ? extractedName.split(" ")[0] : null;
+
+  // Build voice context from approved samples
+  const voiceContext = voiceProfile.samples.length > 0
+    ? `\n\nHere are examples of approved replies from this clinic to match the tone and style:\n${voiceProfile.samples.slice(0, 3).map((s, i) => `Example ${i + 1}:\n${s}`).join("\n\n")}`
+    : "";
+
+  const baseTemplate = REPLY_TEMPLATES[category] ? REPLY_TEMPLATES[category](name) : REPLY_TEMPLATES.other(name);
+
+  const reply = await callAI(
+    `You are writing an email reply on behalf of Expert Physio, a physiotherapy clinic in Burnaby, BC.
+
+Voice guidelines:
+${voiceProfile.guidelines}${voiceContext}
+
+Base template to improve upon:
+"${baseTemplate}"
+
+Original email context:
+From: ${email.from}
+Subject: ${email.subject}
+Body: ${email.body}
+
+Instructions:
+- Use the base template as a starting point but make it feel natural and specific to this email
+- Use the patient's name "${name || "the sender"}" if appropriate
+- Do NOT add a subject line
+- Do NOT make any clinical promises or give medical advice
+- Do NOT mention specific appointment times or dates (no schedule access)
+- Sign off as "Expert Physio Team"
+- Maximum 4 sentences
+- Sound human, not robotic
+
+Write ONLY the email body, starting with the greeting.`,
+    "You write warm, professional physiotherapy clinic emails. Match the clinic's voice exactly."
+  );
+
+  return reply;
+}
+
+
+// ─── CORE ENGINE v3 ───────────────────────────────────────────────────────────
+// Two-step AI review, old/new email separation, notification bell system
+
+const SEND_DELAY_MS   = 5 * 60 * 1000;  // 5-min cancel window
+const OLD_EMAIL_DAYS  = 3;               // emails older than 3 days = "old"
+const CONFIDENCE_MIN  = 88;             // raised from 80 — tighter auto-send threshold
+
+// ─── STATE ────────────────────────────────────────────────────────────────────
+let archiveEmails = [];   // old emails (3+ days) — notification bell, never auto-send
+let notifications = [];  // bell notifications for old email follow-ups
+
+function isOldEmail(email) {
+  if (!email.date) return false;
+  const sent = new Date(email.date);
+  const ageMs = Date.now() - sent.getTime();
+  return ageMs > OLD_EMAIL_DAYS * 24 * 60 * 60 * 1000;
+}
+
+// ─── TWO-STEP AI REVIEW ───────────────────────────────────────────────────────
+/*
+  Step 1 — UNDERSTAND: AI reads the email deeply, extracts intent, risks, context
+  Step 2 — DECIDE:     AI decides what to do and generates the reply
+  Only if both steps pass does the email proceed to the send queue
+*/
 
 async function stepOneUnderstand(email) {
+  log(`[Step 1] Understanding: "${email.subject}"`, "info");
   const raw = await callAI(
-    "Analyse this email for Expert Physio clinic.\n\nFrom: " + email.from + "\nSubject: " + email.subject + "\nBody: " + email.body + '\n\nReturn JSON:\n{"intent":"what sender wants","patientName":"first name or null","urgency":"low|normal|high|critical","risks":["list"],"requiresClinicalJudgment":bool,"requiresScheduleAccess":bool,"isLegalOrFinancial":bool,"sentiment":"positive|neutral|frustrated|angry","suggestedAction":"what clinic should do"}',
-    "You are a careful clinical email analyst. Flag every risk no matter how small.", true
+    `You are reviewing an incoming email for Expert Physio clinic.
+
+Read this email carefully and extract the full context.
+
+From: ${email.from}
+Subject: ${email.subject}
+Body: ${email.body}
+Date received: ${email.date}
+
+Return JSON:
+{
+  "intent": "what the sender actually wants",
+  "patientName": "first name if found, else null",
+  "urgency": "low|normal|high|critical",
+  "risks": ["list any risks, sensitivities, or reasons to be careful"],
+  "requiresClinicalJudgment": true or false,
+  "requiresScheduleAccess": true or false,
+  "isLegalOrFinancial": true or false,
+  "sentiment": "positive|neutral|frustrated|angry",
+  "suggestedAction": "what the clinic should do"
+}`,
+    "You are a careful, thorough clinical email analyst. Extract every relevant detail. Flag any risk, no matter how small.",
+    true
   );
-  try { return parseJSON(raw); } catch { return { intent: "unknown", urgency: "normal", risks: [], requiresClinicalJudgment: false, requiresScheduleAccess: false, isLegalOrFinancial: false, sentiment: "neutral", suggestedAction: "review manually", patientName: null }; }
+  try { return parseJSON(raw); }
+  catch { return { intent: "unknown", urgency: "normal", risks: [], requiresClinicalJudgment: false, requiresScheduleAccess: false, isLegalOrFinancial: false, sentiment: "neutral", suggestedAction: "review manually", patientName: null }; }
 }
 
-async function generateReply(email, understanding, classification) {
-  const name = understanding && understanding.patientName ? understanding.patientName.split(" ")[0] : null;
-  const voiceCtx = voiceProfile.samples.length > 0 ? "\n\nApproved reply examples:\n" + voiceProfile.samples.slice(0,3).join("\n---\n") : "";
+async function stepTwoDecide(email, understanding, classification) {
+  log(`[Step 2] Deciding action: "${email.subject}" | intent: ${understanding.intent}`, "info");
+
+  // Hard rules — never auto-send regardless of confidence
+  if (understanding.requiresClinicalJudgment) return { proceed: false, reason: "Requires clinical judgment" };
+  if (understanding.requiresScheduleAccess)   return { proceed: false, reason: "Requires schedule access" };
+  if (understanding.isLegalOrFinancial)        return { proceed: false, reason: "Legal or financial risk" };
+  if (understanding.urgency === "critical")    return { proceed: false, reason: "Critical urgency — needs human" };
+  if (understanding.sentiment === "angry")     return { proceed: false, reason: "Angry sender — needs human touch" };
+  if (understanding.risks.length > 2)         return { proceed: false, reason: `Multiple risks: ${understanding.risks.slice(0,2).join(", ")}` };
+  if (classification.confidence < CONFIDENCE_MIN) return { proceed: false, reason: `Confidence too low (${classification.confidence}% < ${CONFIDENCE_MIN}%)` };
+  if (!classification.autoSend)               return { proceed: false, reason: classification.reason };
+
+  return { proceed: true, reason: "Passed all checks" };
+}
+
+async function generateSmartReply(email, understanding, classification) {
+  const voiceContext = voiceProfile.samples.length > 0
+    ? `\n\nApproved reply examples from this clinic:\n${voiceProfile.samples.slice(0,3).join("\n---\n")}`
+    : "";
+
   return await callAI(
-    "Write a reply for Expert Physio clinic.\n\nIntent: " + (understanding ? understanding.intent : "unknown") + "\nPatient name: " + (name || "unknown") + "\nSentiment: " + (understanding ? understanding.sentiment : "neutral") + "\n\nEmail:\nFrom: " + email.from + "\nSubject: " + email.subject + "\nBody: " + email.body + "\n\nVoice guidelines:\n" + voiceProfile.guidelines + voiceCtx + "\n\nRules: max 4 sentences, no subject line, no clinical promises, no specific appointment times, sign off as 'Expert Physio Team'. Start with greeting.",
-    "You write warm, natural physiotherapy clinic emails. Sound human, not robotic."
+    `You are writing a reply for Expert Physio clinic.
+
+DEEP CONTEXT:
+- Sender intent: ${understanding.intent}
+- Patient name: ${understanding.patientName || "unknown"}
+- Urgency: ${understanding.urgency}
+- Sentiment: ${understanding.sentiment}
+- Suggested action: ${understanding.suggestedAction}
+
+EMAIL:
+From: ${email.from}
+Subject: ${email.subject}
+Body: ${email.body}
+
+VOICE GUIDELINES:
+${voiceProfile.guidelines}${voiceContext}
+
+INSTRUCTIONS:
+- Address the sender's ACTUAL intent: ${understanding.intent}
+- ${understanding.patientName ? `Use their name: ${understanding.patientName}` : "Use friendly greeting"}
+- Maximum 4 sentences
+- Do NOT include a subject line
+- Do NOT make clinical promises
+- Do NOT reference specific appointment times
+- Sound like a real human wrote this, not a bot
+- Sign off as "Expert Physio Team"
+
+Write ONLY the email body starting with the greeting.`,
+    "You write warm, natural physiotherapy clinic emails. Sound human. Be specific to this exact email, not generic."
   );
 }
 
+// ─── FULL PROCESSING PIPELINE ─────────────────────────────────────────────────
 async function processEmail(id) {
   if (processedIds.has(id)) return;
   processedIds.add(id);
-  let email;
-  try { email = await getEmailDetails(id); } catch (err) { log("Failed to fetch " + id + ": " + err.message, "error"); processedIds.delete(id); return; }
-  log("Received: \"" + email.subject + "\" from " + email.from);
-  const senderName = ((email.from.match(/^([^<]+)</) || [])[1] || "").trim() || email.from.split("@")[0];
-  const contact = upsertCRM(email.from, senderName, email.subject);
-  if (detectLostSignal(email.body)) { contact.status = CRM_STATUSES.LOST; log("CRM: " + senderName + " marked as lost", "info"); }
-  if (contact.status === CRM_STATUSES.OPTED_OUT) { await markRead(id); return; }
-  if (contact.followUpScheduled) { contact.followUpScheduled = false; contact.status = CRM_STATUSES.ACTIVE; }
 
+  let email;
+  try { email = await getEmailDetails(id); }
+  catch (err) { log(`Failed to fetch ${id}: ${err.message}`, "error"); processedIds.delete(id); return; }
+
+  log(`📨 Received: "${email.subject}" from ${email.from}`);
+
+  // ── ROUTE OLD EMAILS TO ARCHIVE ──────────────────────────────────────────────
   if (isOldEmail(email)) {
     await markRead(id);
     await applyLabel(id, "AI-Archived");
-    archiveEmails.unshift({ id: "arch_" + Date.now() + "_" + id, emailId: id, email, archivedAt: new Date().toISOString(), followedUp: false });
+
+    const archiveItem = {
+      id: `arch_${Date.now()}_${id}`,
+      emailId: id,
+      email,
+      archivedAt: new Date().toISOString(),
+      followedUp: false,
+    };
+    archiveEmails.unshift(archiveItem);
     if (archiveEmails.length > 200) archiveEmails.pop();
-    notifications.unshift({ id: "notif_" + Date.now(), type: "old_email", title: "Old email needs follow-up", message: "\"" + email.subject + "\" from " + email.from, createdAt: new Date().toISOString(), read: false });
+
+    // Create notification bell alert
+    const notif = {
+      id: `notif_${Date.now()}`,
+      type: "old_email",
+      title: "Old email needs follow-up",
+      message: `"${email.subject}" from ${email.from} — received ${email.date ? new Date(email.date).toLocaleDateString() : "recently"}`,
+      emailId: id,
+      archiveItemId: archiveItem.id,
+      createdAt: new Date().toISOString(),
+      read: false,
+    };
+    notifications.unshift(notif);
     if (notifications.length > 50) notifications.pop();
-    log("Archived old email: \"" + email.subject + "\"", "archive");
+
+    log(`📁 Archived old email: "${email.subject}" — notification created`, "archive");
     return;
   }
 
+  // ── PROCESS NEW EMAILS WITH TWO-STEP REVIEW ──────────────────────────────────
   try {
     await markRead(id);
+
+    // Step 1 — Understand
     const understanding = await stepOneUnderstand(email);
-    log("[Step 1] Intent: " + understanding.intent + " | Urgency: " + understanding.urgency, "info");
+    log(`[Step 1 ✓] Intent: "${understanding.intent}" | Urgency: ${understanding.urgency} | Risks: ${understanding.risks.length}`, "info");
+
+    // Step 2 — Classify
     const classification = await classify(email);
-    log("[Step 2] Category: " + classification.category + " | Confidence: " + classification.confidence + "%", "info");
+    log(`[Step 2 ✓] Category: ${classification.category} | Confidence: ${classification.confidence}% | AutoSend: ${classification.autoSend}`, "info");
 
-    let proceed = true;
-    let holdReason = "";
-    if (understanding.requiresClinicalJudgment) { proceed = false; holdReason = "Requires clinical judgment"; }
-    else if (understanding.requiresScheduleAccess) { proceed = false; holdReason = "Requires schedule access"; }
-    else if (understanding.isLegalOrFinancial) { proceed = false; holdReason = "Legal or financial risk"; }
-    else if (understanding.urgency === "critical") { proceed = false; holdReason = "Critical urgency"; }
-    else if (understanding.sentiment === "angry") { proceed = false; holdReason = "Angry sender — needs human"; }
-    else if ((understanding.risks || []).length > 2) { proceed = false; holdReason = "Multiple risks detected"; }
-    else if (classification.confidence < CONFIDENCE_MIN) { proceed = false; holdReason = "Confidence too low (" + classification.confidence + "%)"; }
-    else if (!classification.autoSend) { proceed = false; holdReason = classification.reason; }
+    // Step 3 — Decide
+    const decision = await stepTwoDecide(email, understanding, classification);
+    log(`[Step 3 ✓] Decision: ${decision.proceed ? "PROCEED" : "HOLD"} — ${decision.reason}`, decision.proceed ? "info" : "review");
 
-    const reply = await generateReply(email, understanding, classification);
+    if (decision.proceed) {
+      // Generate smart reply using full context
+      const replyBody = await generateSmartReply(email, understanding, classification);
+      log(`[Reply ✓] Generated reply for "${email.subject}"`, "info");
 
-    if (proceed) {
       const sendAt = Date.now() + SEND_DELAY_MS;
-      const qi = { id: "q_" + Date.now() + "_" + id, emailId: id, email, understanding, classification, replyBody: reply, sendAt, cancelled: false, createdAt: new Date().toISOString() };
-      sendQueue.push(qi);
-      log("Queued (5-min window): \"" + email.subject + "\" -> " + email.from, "queued");
+      const queueItem = {
+        id: `q_${Date.now()}_${id}`,
+        emailId: id,
+        email,
+        understanding,
+        classification,
+        replyBody,
+        sendAt,
+        cancelled: false,
+        createdAt: new Date().toISOString(),
+      };
+      sendQueue.push(queueItem);
+      log(`⏱ Queued (5-min window): "${email.subject}" → ${email.from} (${classification.category}, ${classification.confidence}%)`, "queued");
+
       setTimeout(async () => {
-        const item = sendQueue.find(q => q.id === qi.id);
-        if (!item || item.cancelled) { log("Send cancelled: \"" + email.subject + "\"", "cancelled"); return; }
+        const item = sendQueue.find(q => q.id === queueItem.id);
+        if (!item || item.cancelled) { log(`Send cancelled: "${email.subject}"`, "cancelled"); return; }
         try {
           await sendEmail(email.threadId, email.from, email.subject, item.replyBody);
           await applyLabel(id, "AI-Auto-Replied");
-          sentLog.unshift({ id: qi.id, email, understanding, replyBody: item.replyBody, category: classification.category, confidence: classification.confidence, sentAt: new Date().toISOString() });
+          sentLog.unshift({ id: queueItem.id, email, understanding, replyBody: item.replyBody, category: classification.category, confidence: classification.confidence, sentAt: new Date().toISOString() });
           if (sentLog.length > 500) sentLog.pop();
-          sendQueue = sendQueue.filter(q => q.id !== qi.id);
-          log("Auto-sent: \"" + email.subject + "\" -> " + email.from, "sent");
-        } catch (err) { log("Send failed: " + err.message, "error"); sendQueue = sendQueue.filter(q => q.id !== qi.id); }
+          sendQueue = sendQueue.filter(q => q.id !== queueItem.id);
+          log(`✅ Auto-sent: "${email.subject}" → ${email.from}`, "sent");
+        } catch (err) {
+          log(`Send failed "${email.subject}": ${err.message}`, "error");
+          sendQueue = sendQueue.filter(q => q.id !== queueItem.id);
+        }
       }, SEND_DELAY_MS);
+
     } else {
+      // Hold for human review with full context
+      const draftReply = await generateSmartReply(email, understanding, classification);
       await applyLabel(id, "AI-Needs-Review");
-      pendingReview.push({ id: "r_" + Date.now() + "_" + id, emailId: id, email, understanding, classification, draftReply: reply, holdReason, receivedAt: new Date().toISOString() });
-      log("Held for review: \"" + email.subject + "\" — " + holdReason, "review");
+      pendingReview.push({
+        id: `r_${Date.now()}_${id}`,
+        emailId: id,
+        email,
+        understanding,
+        classification,
+        draftReply,
+        holdReason: decision.reason,
+        receivedAt: new Date().toISOString(),
+      });
+      log(`⚠️ Held for review: "${email.subject}" — ${decision.reason}`, "review");
     }
-  } catch (err) { log("Processing error: " + err.message, "error"); processedIds.delete(id); }
+
+  } catch (err) {
+    log(`Processing error "${email?.subject}": ${err.message}`, "error");
+    processedIds.delete(id);
+  }
 }
 
+// ─── POLLING ──────────────────────────────────────────────────────────────────
 let pollingInterval = null;
 
 async function pollInbox() {
@@ -264,344 +526,384 @@ async function pollInbox() {
     const messages = await fetchUnread();
     const newOnes = messages.filter(m => !processedIds.has(m.id));
     if (newOnes.length > 0) {
-      log("Found " + newOnes.length + " new email(s)");
-      for (const m of newOnes) { await processEmail(m.id); await new Promise(r => setTimeout(r, 1500)); }
+      log(`Found ${newOnes.length} new email(s) — processing with 2-step review`);
+      for (const m of newOnes) {
+        await processEmail(m.id);
+        await new Promise(r => setTimeout(r, 1500));
+      }
     }
-  } catch (err) { log("Poll error: " + err.message, "error"); }
+  } catch (err) { log(`Poll error: ${err.message}`, "error"); }
 }
 
 function startPolling() {
   if (pollingInterval) clearInterval(pollingInterval);
   pollingInterval = setInterval(pollInbox, 5 * 60 * 1000);
   pollInbox();
-  log("Autopilot v3 running — 2-step review, every 5 min", "success");
+  log("Autopilot v3 started — 2-step review, old/new separation, every 5 min", "success");
 }
 
-app.get("/api/status", (req, res) => res.json({ connected: !!gmailTokens, queueCount: sendQueue.filter(q => !q.cancelled).length, reviewCount: pendingReview.length, archiveCount: archiveEmails.length, unreadNotifications: notifications.filter(n => !n.read).length, sentToday: sentLog.filter(s => new Date(s.sentAt).toDateString() === new Date().toDateString()).length, processed: processedIds.size, crmTotal: crmContacts.length, crmSilent: crmContacts.filter(c => (Date.now() - new Date(c.lastSeen).getTime()) > FOLLOW_UP_DAYS * 86400000 && c.status !== "lost" && c.status !== "opted_out").length }));
-app.get("/api/log",           (req, res) => res.json(activityLog.slice(0, 100)));
-app.get("/api/review",        (req, res) => res.json(pendingReview));
-app.get("/api/queue",         (req, res) => res.json(sendQueue.filter(q => !q.cancelled)));
-app.get("/api/sent",          (req, res) => res.json(sentLog.slice(0, 100)));
-app.get("/api/voice",         (req, res) => res.json(voiceProfile));
-app.get("/api/archive",       (req, res) => res.json(archiveEmails.slice(0, 100)));
-app.get("/api/notifications", (req, res) => res.json(notifications));
-app.get("/api/crm",           (req, res) => res.json(crmContacts.slice(0, 200)));
-app.get("/api/crm/stats",     (req, res) => { const now = Date.now(); const thr = FOLLOW_UP_DAYS * 86400000; res.json({ total: crmContacts.length, active: crmContacts.filter(c => c.status === "active").length, silent: crmContacts.filter(c => (now - new Date(c.lastSeen).getTime()) > thr && c.status !== "lost" && c.status !== "opted_out").length, followUp: crmContacts.filter(c => c.status === "followup").length, booked: crmContacts.filter(c => c.status === "booked").length, lost: crmContacts.filter(c => c.status === "lost").length }); });
+// ─── API ROUTES ───────────────────────────────────────────────────────────────
+app.get("/api/status", (req, res) => res.json({
+  connected: !!gmailTokens,
+  polling: !!pollingInterval,
+  queueCount: sendQueue.filter(q => !q.cancelled).length,
+  reviewCount: pendingReview.length,
+  archiveCount: archiveEmails.length,
+  unreadNotifications: notifications.filter(n => !n.read).length,
+  sentToday: sentLog.filter(s => new Date(s.sentAt).toDateString() === new Date().toDateString()).length,
+  processed: processedIds.size,
+}));
 
-app.post("/api/queue/:id/cancel", (req, res) => { const item = sendQueue.find(q => q.id === req.params.id); if (!item) return res.status(404).json({ error: "Not found" }); item.cancelled = true; log("Send cancelled: \"" + item.email.subject + "\"", "cancelled"); res.json({ success: true }); });
-app.post("/api/review/:id/approve", async (req, res) => { const item = pendingReview.find(p => p.id === req.params.id); if (!item) return res.status(404).json({ error: "Not found" }); try { const body = req.body.reply || item.draftReply; await sendEmail(item.email.threadId, item.email.from, item.email.subject, body); await applyLabel(item.emailId, "AI-Replied"); sentLog.unshift({ ...item, replyBody: body, sentAt: new Date().toISOString(), manualApproval: true }); pendingReview = pendingReview.filter(p => p.id !== req.params.id); log("Review approved + sent to " + item.email.from, "sent"); res.json({ success: true }); } catch (err) { res.status(500).json({ error: err.message }); } });
-app.post("/api/review/:id/discard", (req, res) => { pendingReview = pendingReview.filter(p => p.id !== req.params.id); res.json({ success: true }); });
-app.post("/api/voice/guidelines", (req, res) => { if (!req.body.guidelines) return res.status(400).json({ error: "Missing" }); voiceProfile.guidelines = req.body.guidelines; res.json({ success: true }); });
-app.post("/api/voice/sample", (req, res) => { if (!req.body.sample) return res.status(400).json({ error: "Missing" }); voiceProfile.samples.push(req.body.sample); if (voiceProfile.samples.length > 10) voiceProfile.samples.shift(); res.json({ success: true }); });
-app.delete("/api/voice/sample/:i", (req, res) => { const i = parseInt(req.params.i); if (isNaN(i) || i < 0 || i >= voiceProfile.samples.length) return res.status(404).json({ error: "Invalid" }); voiceProfile.samples.splice(i, 1); res.json({ success: true }); });
-app.post("/api/archive/:id/followup", (req, res) => { const item = archiveEmails.find(a => a.id === req.params.id); if (!item) return res.status(404).json({ error: "Not found" }); item.followedUp = true; const n = notifications.find(x => x.archiveItemId === req.params.id); if (n) n.read = true; res.json({ success: true }); });
-app.post("/api/notifications/read-all", (req, res) => { notifications.forEach(n => n.read = true); res.json({ success: true }); });
-app.post("/api/notifications/:id/read", (req, res) => { const n = notifications.find(x => x.id === req.params.id); if (n) n.read = true; res.json({ success: true }); });
-app.post("/api/crm", (req, res) => { const { email, name, notes } = req.body; if (!email) return res.status(400).json({ error: "Email required" }); const c = upsertCRM(email, name || email.split("@")[0], "Manually added"); if (notes) c.notes = notes; res.json({ success: true, contact: c }); });
-app.patch("/api/crm/:id", (req, res) => { const c = crmContacts.find(x => x.id === req.params.id); if (!c) return res.status(404).json({ error: "Not found" }); if (req.body.status) c.status = req.body.status; if (req.body.notes !== undefined) c.notes = req.body.notes; if (req.body.name) c.name = req.body.name; res.json({ success: true }); });
-app.post("/api/poll", (req, res) => { if (!gmailTokens) return res.status(400).json({ error: "Not connected" }); pollInbox(); res.json({ success: true }); });
-app.post("/api/claude", async (req, res) => { if (!ANTHROPIC_KEY) return res.status(500).json({ error: "No API key" }); try { const r = await fetch("https://api.anthropic.com/v1/messages", { method: "POST", headers: { "Content-Type": "application/json", "x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01" }, body: JSON.stringify(req.body) }); const data = await r.json(); if (!r.ok) return res.status(r.status).json(data); res.json(data); } catch (err) { res.status(500).json({ error: err.message }); } });
+app.get("/api/log",          (req, res) => res.json(activityLog.slice(0, 100)));
+app.get("/api/review",       (req, res) => res.json(pendingReview));
+app.get("/api/queue",        (req, res) => res.json(sendQueue.filter(q => !q.cancelled)));
+app.get("/api/sent",         (req, res) => res.json(sentLog.slice(0, 100)));
+app.get("/api/voice",        (req, res) => res.json(voiceProfile));
+app.get("/api/archive",      (req, res) => res.json(archiveEmails.slice(0, 100)));
+app.get("/api/notifications",(req, res) => res.json(notifications));
 
-// ─── DASHBOARD ────────────────────────────────────────────────────────────────
-// NOTE: The HTML uses NO template variables (no ${...}), NO nested backticks.
-// All dynamic content is loaded via /api/* endpoints after page load.
-// This guarantees the page always renders regardless of server state.
-const DASHBOARD_HTML = `<!DOCTYPE html>
+// Mark notification as read
+app.post("/api/notifications/:id/read", (req, res) => {
+  const n = notifications.find(x => x.id === req.params.id);
+  if (n) n.read = true;
+  res.json({ success: true });
+});
+
+// Mark all notifications read
+app.post("/api/notifications/read-all", (req, res) => {
+  notifications.forEach(n => n.read = true);
+  res.json({ success: true });
+});
+
+// Mark archive item as followed up
+app.post("/api/archive/:id/followup", (req, res) => {
+  const item = archiveEmails.find(a => a.id === req.params.id);
+  if (!item) return res.status(404).json({ error: "Not found" });
+  item.followedUp = true;
+  const notif = notifications.find(n => n.archiveItemId === req.params.id);
+  if (notif) notif.read = true;
+  log(`Archive follow-up marked: "${item.email.subject}"`, "info");
+  res.json({ success: true });
+});
+
+// Cancel queued send
+app.post("/api/queue/:id/cancel", (req, res) => {
+  const item = sendQueue.find(q => q.id === req.params.id);
+  if (!item) return res.status(404).json({ error: "Not found" });
+  item.cancelled = true;
+  log(`Send cancelled: "${item.email.subject}"`, "cancelled");
+  res.json({ success: true });
+});
+
+// Approve review
+app.post("/api/review/:id/approve", async (req, res) => {
+  const item = pendingReview.find(p => p.id === req.params.id);
+  if (!item) return res.status(404).json({ error: "Not found" });
+  try {
+    const body = req.body.reply || item.draftReply;
+    await sendEmail(item.email.threadId, item.email.from, item.email.subject, body);
+    await applyLabel(item.emailId, "AI-Replied");
+    sentLog.unshift({ ...item, replyBody: body, sentAt: new Date().toISOString(), manualApproval: true });
+    pendingReview = pendingReview.filter(p => p.id !== req.params.id);
+    log(`✅ Review approved + sent to ${item.email.from}`, "sent");
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Discard review
+app.post("/api/review/:id/discard", (req, res) => {
+  const before = pendingReview.length;
+  pendingReview = pendingReview.filter(p => p.id !== req.params.id);
+  pendingReview.length < before ? res.json({ success: true }) : res.status(404).json({ error: "Not found" });
+});
+
+// Voice
+app.post("/api/voice/guidelines", (req, res) => {
+  if (!req.body.guidelines) return res.status(400).json({ error: "Missing guidelines" });
+  voiceProfile.guidelines = req.body.guidelines;
+  log("Voice guidelines updated", "info");
+  res.json({ success: true });
+});
+app.post("/api/voice/sample", (req, res) => {
+  if (!req.body.sample) return res.status(400).json({ error: "Missing sample" });
+  voiceProfile.samples.push(req.body.sample);
+  if (voiceProfile.samples.length > 10) voiceProfile.samples.shift();
+  log(`Voice sample added (${voiceProfile.samples.length} total)`, "info");
+  res.json({ success: true });
+});
+app.delete("/api/voice/sample/:index", (req, res) => {
+  const i = parseInt(req.params.index);
+  if (isNaN(i) || i < 0 || i >= voiceProfile.samples.length) return res.status(404).json({ error: "Invalid index" });
+  voiceProfile.samples.splice(i, 1);
+  res.json({ success: true });
+});
+
+app.post("/api/poll", (req, res) => {
+  if (!gmailTokens) return res.status(400).json({ error: "Gmail not connected" });
+  pollInbox();
+  res.json({ success: true });
+});
+
+app.post("/api/claude", async (req, res) => {
+  if (!ANTHROPIC_KEY) return res.status(500).json({ error: "ANTHROPIC_API_KEY not set" });
+  try {
+    const response = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01" },
+      body: JSON.stringify(req.body),
+    });
+    const data = await response.json();
+    if (!response.ok) return res.status(response.status).json(data);
+    res.json(data);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ─── DASHBOARD v3 ─────────────────────────────────────────────────────────────
+app.get("*", (req, res) => {
+  res.send(`<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8"/>
   <meta name="viewport" content="width=device-width,initial-scale=1.0"/>
   <title>Expert Physio AI Agent</title>
-  <link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,300;0,400;0,500;1,300;1,400&family=Outfit:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=DM+Serif+Display&display=swap" rel="stylesheet">
   <style>
-    :root {
-      --sage:      #5C7A5F;
-      --sage-deep: #3A5C3D;
-      --sage-pale: #EEF4EE;
-      --sage-lt:   #A8C5A0;
-      --cream:     #FAF8F5;
-      --white:     #FFFFFF;
-      --charcoal:  #2C2C2C;
-      --text:      #3A3730;
-      --muted:     #7A7570;
-      --stone:     #9C9590;
-      --stone-lt:  #C8C3BC;
-      --border:    #E8E2DA;
-      --border-lt: #F2EDE8;
-      --amber:     #C4913A;
-      --amber-lt:  #F5E8D0;
-      --red:       #C0503A;
-      --red-lt:    #F5E8E4;
-      --blue:      #4A7AB5;
-      --blue-lt:   #E4EEF8;
-      --shadow:    0 2px 8px rgba(44,44,44,.07);
-      --shadow-md: 0 4px 20px rgba(44,44,44,.11);
-      --r:         12px;
-      --r-sm:      8px;
-    }
     *{box-sizing:border-box;margin:0;padding:0}
-    html,body{height:100%;overflow:hidden}
-    body{font-family:'Outfit',sans-serif;background:var(--cream);color:var(--text);display:flex;flex-direction:column}
+    body{font-family:'DM Sans','Helvetica Neue',sans-serif;background:#F8FAFC;color:#111827;height:100vh;overflow:hidden;display:flex;flex-direction:column}
     @keyframes spin{to{transform:rotate(360deg)}}
-    @keyframes fadeUp{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
-    @keyframes pulse{0%,100%{opacity:1}50%{opacity:.45}}
-    ::-webkit-scrollbar{width:3px}
-    ::-webkit-scrollbar-thumb{background:var(--stone-lt);border-radius:3px}
-    input,textarea,button,select{font-family:'Outfit',sans-serif}
-    input:focus,textarea:focus{outline:none;border-color:var(--sage);box-shadow:0 0 0 3px rgba(92,122,95,.12)}
-
-    .btn{display:inline-flex;align-items:center;gap:6px;padding:8px 16px;border:none;border-radius:var(--r-sm);cursor:pointer;font-size:12.5px;font-weight:500;transition:all .15s}
-    .btn:disabled{opacity:.45;cursor:not-allowed}
-    .btn-primary{background:var(--sage);color:#fff;box-shadow:var(--shadow)}
-    .btn-primary:hover:not(:disabled){background:var(--sage-deep);transform:translateY(-1px);box-shadow:var(--shadow-md)}
-    .btn-success{background:var(--sage-deep);color:#fff}
-    .btn-success:hover:not(:disabled){background:#2D4830;transform:translateY(-1px)}
-    .btn-ghost{background:transparent;color:var(--muted);border:1px solid var(--border)}
-    .btn-ghost:hover:not(:disabled){background:var(--border-lt);color:var(--text)}
-    .btn-amber{background:var(--amber-lt);color:var(--amber);border:1px solid #E8D0A8}
-    .btn-danger{background:var(--red-lt);color:var(--red)}
-    .btn-sm{padding:5px 11px;font-size:11.5px}
-
-    .card{background:var(--white);border:1px solid var(--border);border-radius:var(--r);box-shadow:var(--shadow);padding:20px;margin-bottom:14px}
-
-    .tab-btn{width:100%;padding:10px 16px;background:transparent;border:none;border-left:2px solid transparent;cursor:pointer;text-align:left;font-size:13px;font-weight:400;color:var(--muted);display:flex;align-items:center;justify-content:space-between;transition:all .12s}
-    .tab-btn.active{background:linear-gradient(90deg,var(--sage-pale),transparent);border-left-color:var(--sage);font-weight:600;color:var(--sage-deep)}
-    .tab-btn:hover:not(.active){background:var(--border-lt);color:var(--text)}
-
-    .tag{font-size:10.5px;font-weight:600;padding:2px 8px;border-radius:20px;display:inline-block;letter-spacing:.02em}
-    .badge{border-radius:20px;font-size:10px;font-weight:700;padding:1px 6px;color:#fff;display:none}
-    .dot{width:7px;height:7px;border-radius:50%;display:inline-block;flex-shrink:0}
-    .spinner{width:14px;height:14px;border-radius:50%;border:2px solid var(--border);border-top-color:var(--sage);animation:spin .7s linear infinite;flex-shrink:0;display:inline-block}
-    .step-badge{font-size:10px;font-weight:600;padding:2px 8px;border-radius:20px;background:var(--blue-lt);color:var(--blue);display:inline-block}
-
-    .page-title{font-family:'Cormorant Garamond',serif;font-size:26px;font-weight:500;color:var(--charcoal);letter-spacing:-.3px}
-    .page-sub{font-size:13px;color:var(--muted);margin-top:4px;line-height:1.6;font-weight:300}
-
-    .rule-row{display:flex;align-items:center;justify-content:space-between;padding:10px 0;border-bottom:1px solid var(--border-lt)}
-    .rule-row:last-child{border-bottom:none}
-
-    .email-row{padding:12px 14px;cursor:pointer;border-bottom:1px solid var(--border-lt);border-left:2px solid transparent;transition:all .1s}
-    .email-row:hover{background:var(--sage-pale)}
-    .email-row.selected{background:var(--sage-pale);border-left-color:var(--sage)}
-
-    #toast{position:fixed;top:20px;right:20px;z-index:9999;background:var(--charcoal);color:#fff;padding:11px 20px;border-radius:var(--r);font-size:13px;font-weight:500;box-shadow:var(--shadow-md);display:none;align-items:center;gap:12px;max-width:380px;animation:fadeUp .25s ease}
-    #notif-panel{position:fixed;top:64px;right:16px;width:360px;background:var(--white);border:1px solid var(--border);border-radius:var(--r);box-shadow:var(--shadow-md);z-index:500;display:none;max-height:460px;overflow-y:auto}
+    @keyframes fadeIn{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
+    @keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+    @keyframes bellShake{0%,100%{transform:rotate(0)}20%{transform:rotate(-15deg)}40%{transform:rotate(15deg)}60%{transform:rotate(-10deg)}80%{transform:rotate(10deg)}}
+    ::-webkit-scrollbar{width:4px}
+    ::-webkit-scrollbar-thumb{background:#CBD5E1;border-radius:4px}
+    input,textarea,button{font-family:inherit}
+    textarea:focus,input:focus{outline:2px solid #0EA5E9;outline-offset:1px;border-radius:4px}
+    .tab-btn{width:100%;padding:10px 16px;background:transparent;border:none;border-left:3px solid transparent;cursor:pointer;text-align:left;font-size:13px;font-weight:400;color:#374151;display:flex;align-items:center;justify-content:space-between}
+    .tab-btn.active{background:#F0F9FF;border-left-color:#0EA5E9;font-weight:600;color:#0284C7}
+    .tab-btn:hover:not(.active){background:#F8FAFC}
+    .btn{padding:9px 18px;border:none;border-radius:8px;cursor:pointer;font-size:13px;font-weight:600;display:inline-flex;align-items:center;gap:6px}
+    .btn:disabled{opacity:.5;cursor:not-allowed}
+    .btn-blue{background:#0EA5E9;color:#fff}
+    .btn-green{background:#059669;color:#fff}
+    .btn-gray{background:#F1F5F9;color:#475569;border:1px solid #E2E8F0}
+    .btn-red{background:#FEE2E2;color:#C0392B}
+    .btn-amber{background:#FEF3C7;color:#92400E;border:1px solid #FCD34D}
+    .card{background:#fff;border:1px solid #E5E7EB;border-radius:12px;padding:18px;margin-bottom:14px}
+    .spinner{width:14px;height:14px;border-radius:50%;border:2px solid #E5E7EB;border-top-color:#0EA5E9;animation:spin .7s linear infinite;flex-shrink:0}
+    .tag{font-size:10px;font-weight:600;padding:2px 8px;border-radius:20px}
+    .step-badge{font-size:10px;font-weight:700;padding:2px 8px;border-radius:20px;background:#EFF6FF;color:#1D4ED8}
+    #toast{position:fixed;top:20px;right:20px;z-index:9999;background:#111827;color:#fff;padding:11px 20px;border-radius:10px;font-size:13px;font-weight:500;box-shadow:0 4px 24px rgba(0,0,0,.25);display:none;align-items:center;gap:12px;max-width:380px}
+    #notif-panel{position:fixed;top:60px;right:16px;width:360px;background:#fff;border:1px solid #E5E7EB;border-radius:12px;box-shadow:0 8px 32px rgba(0,0,0,.12);z-index:500;display:none;max-height:480px;overflow-y:auto}
   </style>
 </head>
 <body>
+<div id="toast"><span id="toast-msg"></span><button onclick="hideToast()" style="background:none;border:none;color:#9CA3AF;cursor:pointer;font-size:18px;line-height:1">×</button></div>
 
-<div id="toast"><span id="toast-msg"></span><button onclick="hideToast()" style="background:none;border:none;color:rgba(255,255,255,.5);cursor:pointer;font-size:18px;line-height:1">x</button></div>
-
+<!-- NOTIFICATION PANEL -->
 <div id="notif-panel">
-  <div style="padding:14px 16px;border-bottom:1px solid var(--border-lt);display:flex;align-items:center;justify-content:space-between">
-    <span style="font-family:'Cormorant Garamond',serif;font-size:18px;font-weight:500">Notifications</span>
-    <button onclick="markAllRead()" class="btn btn-ghost btn-sm">Mark all read</button>
+  <div style="padding:14px 16px;border-bottom:1px solid #F3F4F6;display:flex;align-items:center;justify-content:space-between">
+    <div style="font-size:14px;font-weight:700">🔔 Notifications</div>
+    <button onclick="markAllRead()" style="font-size:12px;color:#0EA5E9;background:none;border:none;cursor:pointer;font-weight:500">Mark all read</button>
   </div>
-  <div id="notif-list"><div style="padding:24px;text-align:center;color:var(--stone-lt);font-size:13px">No notifications</div></div>
+  <div id="notif-list"><div style="padding:20px;text-align:center;color:#9CA3AF;font-size:13px">No notifications</div></div>
 </div>
 
 <!-- HEADER -->
-<div style="background:var(--white);border-bottom:1px solid var(--border);height:60px;display:flex;align-items:center;justify-content:space-between;padding:0 24px;flex-shrink:0;box-shadow:var(--shadow)">
-  <div style="display:flex;align-items:center;gap:12px">
-    <div style="width:38px;height:38px;border-radius:10px;background:linear-gradient(135deg,var(--sage-deep),var(--sage));display:flex;align-items:center;justify-content:center;flex-shrink:0">
-      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round"><path d="M12 2C12 2 5 7 5 13c0 6 7 9 7 9s7-3 7-9c0-6-7-11-7-11z"/><path d="M9 13h6M12 10v6"/></svg>
-    </div>
+<div style="background:#0B1F3A;height:56px;display:flex;align-items:center;justify-content:space-between;padding:0 22px;flex-shrink:0;border-bottom:1px solid #1E3A5F">
+  <div style="display:flex;align-items:center;gap:10px">
+    <div style="width:32px;height:32px;border-radius:8px;background:linear-gradient(135deg,#0EA5E9,#0369A1);display:flex;align-items:center;justify-content:center;font-size:16px">🤖</div>
     <div>
-      <div style="font-family:'Cormorant Garamond',serif;font-size:17px;font-weight:500;color:var(--charcoal);line-height:1.1">Expert Physio <em style="font-style:italic;font-weight:300">AI Agent</em></div>
-      <div id="status-bar" style="font-size:10.5px;display:flex;align-items:center;gap:5px;margin-top:1px">
-        <span class="dot" id="status-dot" style="background:var(--red)"></span>
-        <span id="status-text" style="color:var(--muted)">Loading…</span>
-      </div>
+      <div style="font-family:'DM Serif Display',serif;font-size:16px;color:#fff">Expert Physio AI Agent <span style="font-size:10px;color:#64B5D9;font-family:'DM Sans',sans-serif;font-weight:400">v3 — 2-Step Review</span></div>
+      <div id="status-line" style="font-size:10px;color:#FCA5A5">○ Gmail not connected</div>
     </div>
   </div>
   <div style="display:flex;gap:10px;align-items:center">
-    <div id="header-badges" style="display:flex;gap:8px;align-items:center"></div>
-    <button id="bell-btn" onclick="toggleNotif()" style="position:relative;background:none;border:none;cursor:pointer;padding:6px;color:var(--stone)">
-      <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg>
-      <span id="bell-badge" class="badge" style="position:absolute;top:-2px;right:-2px;background:var(--red)"></span>
+    <div id="header-badges"></div>
+    <!-- Notification Bell -->
+    <button id="bell-btn" onclick="toggleNotifPanel()" style="position:relative;background:none;border:none;cursor:pointer;padding:4px;color:#7DD3FC;font-size:20px">
+      🔔
+      <span id="bell-badge" style="position:absolute;top:-2px;right:-2px;background:#EF4444;color:#fff;border-radius:10px;font-size:9px;font-weight:700;padding:1px 4px;display:none"></span>
     </button>
-    <div id="connect-area"></div>
+    <div id="connect-btn-area"></div>
   </div>
 </div>
 
 <!-- BODY -->
 <div style="display:flex;flex:1;overflow:hidden">
-
   <!-- SIDEBAR -->
-  <div style="width:210px;background:var(--white);border-right:1px solid var(--border);display:flex;flex-direction:column;flex-shrink:0">
+  <div style="width:200px;background:#fff;border-right:1px solid #E5E7EB;display:flex;flex-direction:column;flex-shrink:0">
     <div style="padding:14px 0;flex:1">
-      <button class="tab-btn active" id="tab-autopilot"  onclick="showTab('autopilot')"> <span>&#x26A1; Autopilot</span>    <span id="badge-autopilot"  class="badge" style="background:var(--amber)"></span></button>
-      <button class="tab-btn"        id="tab-queue"      onclick="showTab('queue')">     <span>&#x1F441; Review Queue</span><span id="badge-queue"      class="badge" style="background:var(--red)"></span></button>
-      <button class="tab-btn"        id="tab-archive"    onclick="showTab('archive')">   <span>&#x1F4C1; Old Emails</span>  <span id="badge-archive"    class="badge" style="background:var(--amber)"></span></button>
-      <button class="tab-btn"        id="tab-crm"        onclick="showTab('crm')">       <span>&#x1F465; Patients</span>   <span id="badge-crm"        class="badge" style="background:var(--amber)"></span></button>
-      <button class="tab-btn"        id="tab-voice"      onclick="showTab('voice')">     <span>&#x1F399; Voice Profile</span></button>
-      <button class="tab-btn"        id="tab-inbox"      onclick="showTab('inbox')">     <span>&#x1F4EC; Demo Inbox</span> <span id="badge-inbox"      class="badge" style="background:var(--sage)"></span></button>
-      <button class="tab-btn"        id="tab-compose"    onclick="showTab('compose')">   <span>&#x270F; Compose</span></button>
-      <button class="tab-btn"        id="tab-sent"       onclick="showTab('sent')">      <span>&#x1F4CA; Sent Log</span></button>
+      <button class="tab-btn active" id="tab-Autopilot" onclick="showTab('Autopilot')"><span>⚡ Autopilot</span><span id="badge-Autopilot" style="background:#F59E0B;color:#fff;border-radius:10px;font-size:10px;font-weight:700;padding:1px 6px;display:none"></span></button>
+      <button class="tab-btn" id="tab-Queue" onclick="showTab('Queue')"><span>👁 Review Queue</span><span id="badge-Queue" style="background:#EF4444;color:#fff;border-radius:10px;font-size:10px;font-weight:700;padding:1px 6px;display:none"></span></button>
+      <button class="tab-btn" id="tab-Archive" onclick="showTab('Archive')"><span>📁 Old Emails</span><span id="badge-Archive" style="background:#F59E0B;color:#fff;border-radius:10px;font-size:10px;font-weight:700;padding:1px 6px;display:none"></span></button>
+      <button class="tab-btn" id="tab-Voice" onclick="showTab('Voice')"><span>🎙 Voice Profile</span></button>
+      <button class="tab-btn" id="tab-Inbox" onclick="showTab('Inbox')"><span>📬 Demo Inbox</span></button>
+      <button class="tab-btn" id="tab-Compose" onclick="showTab('Compose')"><span>✏️ Compose</span></button>
+      <button class="tab-btn" id="tab-Sent" onclick="showTab('Sent')"><span>📊 Sent Log</span></button>
     </div>
-    <div style="margin:0 12px 14px;padding:13px;background:var(--sage-pale);border-radius:var(--r-sm);border:1px solid rgba(92,122,95,.15)">
-      <div style="font-size:10px;font-weight:700;color:var(--sage-deep);margin-bottom:8px;letter-spacing:.08em;text-transform:uppercase">Today</div>
-      <div id="sidebar-stats" style="font-size:12px;color:var(--muted);line-height:2">—</div>
+    <div style="margin:0 10px 14px;padding:12px;background:#F8FAFC;border-radius:10px;border:1px solid #E5E7EB">
+      <div style="font-size:10px;font-weight:700;color:#6B7280;margin-bottom:7px;letter-spacing:.5px">TODAY</div>
+      <div id="sidebar-stats" style="font-size:12px;color:#374151;line-height:1.9">Loading…</div>
     </div>
   </div>
 
-  <!-- MAIN AREA -->
+  <!-- MAIN -->
   <div style="flex:1;overflow:hidden;display:flex;flex-direction:column">
-    <div id="err-bar" style="display:none;background:var(--red-lt);border-bottom:1px solid #E8C0B8;padding:10px 20px;font-size:13px;color:var(--red);justify-content:space-between;align-items:center">
-      <span id="err-msg"></span><button onclick="hideErr()" style="background:none;border:none;color:var(--red);cursor:pointer;font-size:16px;margin-left:12px">x</button>
+    <div id="err-banner" style="display:none;background:#FFF0F0;border:1px solid #FECACA;border-radius:8px;padding:10px 16px;font-size:13px;color:#B91C1C;justify-content:space-between;align-items:center;margin:8px 16px 0">
+      <span id="err-msg"></span>
+      <button onclick="hideErr()" style="background:none;border:none;color:#B91C1C;cursor:pointer;font-size:16px;margin-left:12px">×</button>
     </div>
+
     <div style="flex:1;overflow:hidden;display:flex">
 
-      <!-- AUTOPILOT -->
-      <div id="pane-autopilot" style="flex:1;overflow-y:auto;padding:32px">
-        <div style="max-width:760px">
-          <div class="page-title">Autopilot Status</div>
-          <div class="page-sub">Every email passes a 2-step AI review before anything is sent. Old emails are archived and flagged for follow-up.</div>
-          <div id="connect-banner" style="margin-top:20px"></div>
-          <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:20px 0">
-            <div class="card" style="border-left:3px solid var(--sage);padding:16px;margin:0">
-              <div class="step-badge" style="margin-bottom:8px">Step 1 — Understand</div>
-              <div style="font-size:12.5px;color:var(--muted);line-height:1.7;margin-top:4px">Reads intent, name, urgency, sentiment, and flags every risk before taking any action.</div>
-            </div>
-            <div class="card" style="border-left:3px solid var(--amber);padding:16px;margin:0">
-              <div class="step-badge" style="background:var(--amber-lt);color:var(--amber);margin-bottom:8px">Step 2 — Decide</div>
-              <div style="font-size:12.5px;color:var(--muted);line-height:1.7;margin-top:4px">Checks 6 safety gates. Confidence 80%+ required. Then 5-minute cancel window before send.</div>
+      <!-- AUTOPILOT TAB -->
+      <div id="pane-Autopilot" style="flex:1;overflow-y:auto;padding:28px">
+        <div style="max-width:780px">
+          <div style="font-family:'DM Serif Display',serif;font-size:22px;margin-bottom:4px">Autopilot Status</div>
+          <div style="font-size:13px;color:#64748B;margin-bottom:20px">Every email goes through a 2-step AI review before anything happens. Old emails are separated and flagged for follow-up.</div>
+
+          <div id="connect-banner"></div>
+
+          <!-- 2-Step Explainer -->
+          <div class="card" style="margin-bottom:16px;background:linear-gradient(135deg,#F0F9FF,#EFF6FF);border-color:#BAE6FD">
+            <div style="font-size:14px;font-weight:700;margin-bottom:12px;color:#0284C7">🧠 How the 2-Step Review Works</div>
+            <div style="display:flex;gap:0">
+              <div style="flex:1;padding:12px;background:#fff;border-radius:8px;margin-right:8px;border:1px solid #E0F2FE">
+                <div class="step-badge" style="margin-bottom:6px">Step 1 — Understand</div>
+                <div style="font-size:12px;color:#374151;line-height:1.6">AI reads the email deeply. Extracts intent, patient name, urgency, sentiment, and any risks or red flags before doing anything.</div>
+              </div>
+              <div style="flex:1;padding:12px;background:#fff;border-radius:8px;border:1px solid #E0F2FE">
+                <div class="step-badge" style="margin-bottom:6px">Step 2 — Decide</div>
+                <div style="font-size:12px;color:#374151;line-height:1.6">AI checks 6 safety rules. Only if all pass AND confidence ≥ 88% does it generate a reply and queue it with a 5-min cancel window.</div>
+              </div>
             </div>
           </div>
-          <div id="queue-panel" style="display:none;background:var(--amber-lt);border:1px solid #E8D0A8;border-radius:var(--r);padding:18px;margin-bottom:16px">
-            <div style="font-size:13.5px;font-weight:600;color:var(--amber);margin-bottom:12px">&#x23F1; Cancel Window Active</div>
-            <div id="queue-items"></div>
+
+          <!-- Send Queue -->
+          <div id="send-queue-panel" style="display:none;background:#FFFBEB;border:1px solid #FDE68A;border-radius:12px;padding:18px;margin-bottom:16px">
+            <div style="font-size:14px;font-weight:700;margin-bottom:12px;color:#92400E">⏱ Cancel Window — Sending Soon</div>
+            <div id="send-queue-items"></div>
           </div>
+
+          <!-- Rules -->
           <div class="card">
-            <div style="font-family:'Cormorant Garamond',serif;font-size:19px;font-weight:500;margin-bottom:4px">Auto-Send Rules</div>
-            <div style="font-size:11.5px;color:var(--stone-lt);margin-bottom:14px">Confidence threshold: 80% &middot; Emails 3+ days old: archived, never auto-sent</div>
-            <div class="rule-row"><div style="display:flex;align-items:center;gap:10px"><span style="font-size:16px">&#x1F4C5;</span><div><div style="font-size:13px;font-weight:500">Cancellations</div><div style="font-size:11.5px;color:var(--muted)">Acknowledge + offer reschedule</div></div></div><span class="tag" style="background:var(--sage-pale);color:var(--sage-deep)">&#x2713; Auto</span></div>
-            <div class="rule-row"><div style="display:flex;align-items:center;gap:10px"><span style="font-size:16px">&#x1F64B;</span><div><div style="font-size:13px;font-weight:500">New Patient Inquiries</div><div style="font-size:11.5px;color:var(--muted)">Welcome + booking information</div></div></div><span class="tag" style="background:var(--sage-pale);color:var(--sage-deep)">&#x2713; Auto</span></div>
-            <div class="rule-row"><div style="display:flex;align-items:center;gap:10px"><span style="font-size:16px">&#x1F4B3;</span><div><div style="font-size:13px;font-weight:500">Simple Billing Questions</div><div style="font-size:11.5px;color:var(--muted)">Acknowledge + 1-2 day follow-up</div></div></div><span class="tag" style="background:var(--sage-pale);color:var(--sage-deep)">&#x2713; Auto</span></div>
-            <div class="rule-row"><div style="display:flex;align-items:center;gap:10px"><span style="font-size:16px">&#x1F468;&#x200D;&#x2695;&#xFE0F;</span><div><div style="font-size:13px;font-weight:500">Doctor Referrals</div><div style="font-size:11.5px;color:var(--muted)">Confirm receipt + contact timeline</div></div></div><span class="tag" style="background:var(--sage-pale);color:var(--sage-deep)">&#x2713; Auto</span></div>
-            <div class="rule-row"><div style="display:flex;align-items:center;gap:10px"><span style="font-size:16px">&#x1F3E5;</span><div><div style="font-size:13px;font-weight:500">ICBC Claims</div><div style="font-size:11.5px;color:var(--muted)">Always held for staff review</div></div></div><span class="tag" style="background:var(--red-lt);color:var(--red)">&#x1F441; Review</span></div>
-            <div class="rule-row"><div style="display:flex;align-items:center;gap:10px"><span style="font-size:16px">&#x1F621;</span><div><div style="font-size:13px;font-weight:500">Complaints / Anger</div><div style="font-size:11.5px;color:var(--muted)">Always held — human touch required</div></div></div><span class="tag" style="background:var(--red-lt);color:var(--red)">&#x1F441; Review</span></div>
-            <div class="rule-row"><div style="display:flex;align-items:center;gap:10px"><span style="font-size:16px">&#x2753;</span><div><div style="font-size:13px;font-weight:500">Confidence &lt; 80%</div><div style="font-size:11.5px;color:var(--muted)">Held — AI not certain enough</div></div></div><span class="tag" style="background:var(--red-lt);color:var(--red)">&#x1F441; Review</span></div>
+            <div style="font-size:14px;font-weight:700;margin-bottom:14px">⚡ Auto-Send Rules <span style="font-size:11px;color:#6B7280;font-weight:400">(confidence threshold: 88%)</span></div>
+            ${[
+              ['📅','Cancellations','Auto-reply offering reschedule',true],
+              ['🙋','New Patient Inquiries','Auto-reply with welcome + booking info',true],
+              ['💳','Simple Billing Questions','Auto-reply acknowledging, 1-2 day follow-up',true],
+              ['👨‍⚕️','Doctor Referrals','Auto-reply confirming receipt',true],
+              ['🏥','ICBC Claims','Always held — staff review required',false],
+              ['😤','Complaints / Anger','Always held — needs human touch',false],
+              ['🩺','Clinical Questions','Always held — requires therapist judgment',false],
+              ['📅','Schedule Requests','Always held — requires calendar access',false],
+              ['❓','Confidence < 88%','Held — AI not certain enough to send',false],
+              ['📁','Emails 3+ Days Old','Archived + notification — never auto-sent',false],
+            ].map(([icon,label,action,auto]) => `
+            <div style="display:flex;align-items:center;justify-content:space-between;padding:8px 0;border-bottom:1px solid #F3F4F6">
+              <div style="display:flex;align-items:center;gap:10px">
+                <span style="font-size:16px">${icon}</span>
+                <div><div style="font-size:13px;font-weight:600">${label}</div><div style="font-size:11px;color:#6B7280">${action}</div></div>
+              </div>
+              <span style="font-size:11px;font-weight:600;padding:3px 10px;border-radius:20px;background:${auto?'#F0FFF4':'#FFF0F0'};color:${auto?'#166534':'#C0392B'}">${auto?'✓ Auto-Send':'👁 Review First'}</span>
+            </div>`).join('')}
           </div>
+
+          <!-- Live Log -->
           <div class="card">
-            <div style="font-family:'Cormorant Garamond',serif;font-size:19px;font-weight:500;margin-bottom:14px">Live Activity</div>
-            <div id="live-log"><div style="font-size:13px;color:var(--stone-lt);font-style:italic">No activity yet — connect Gmail to begin.</div></div>
+            <div style="font-size:14px;font-weight:700;margin-bottom:14px">📊 Live Activity</div>
+            <div id="live-log"><div style="font-size:13px;color:#9CA3AF">No activity yet.</div></div>
           </div>
         </div>
       </div>
 
-      <!-- REVIEW QUEUE -->
-      <div id="pane-queue" style="display:none;flex:1;overflow-y:auto;padding:32px">
-        <div style="max-width:720px">
-          <div class="page-title">Review Queue</div>
-          <div class="page-sub">Emails the AI held for human approval. Pre-written draft included — edit and send with one click.</div>
-          <div id="review-list" style="margin-top:24px"></div>
+      <!-- QUEUE TAB -->
+      <div id="pane-Queue" style="display:none;flex:1;overflow-y:auto;padding:28px">
+        <div style="max-width:740px">
+          <div style="font-family:'DM Serif Display',serif;font-size:22px;margin-bottom:4px">Review Queue</div>
+          <div style="font-size:13px;color:#64748B;margin-bottom:20px">Emails that failed the 2-step review. Full AI analysis shown — draft reply pre-written. Edit and approve with one click.</div>
+          <div id="review-queue-items"></div>
         </div>
       </div>
 
-      <!-- OLD EMAILS / ARCHIVE -->
-      <div id="pane-archive" style="display:none;flex:1;overflow-y:auto;padding:32px">
-        <div style="max-width:720px">
-          <div class="page-title">Old Emails</div>
-          <div class="page-sub">Emails received before the agent connected. Separated so new emails get priority. Each sender is waiting for a reply.</div>
-          <div style="margin:14px 0;padding:10px 14px;background:var(--red-lt);border-radius:var(--r-sm);font-size:12.5px;color:var(--red);font-weight:500">&#x26A0; These senders have not received a reply — each one is a potential lost patient.</div>
-          <div id="archive-list"></div>
+      <!-- ARCHIVE TAB -->
+      <div id="pane-Archive" style="display:none;flex:1;overflow-y:auto;padding:28px">
+        <div style="max-width:740px">
+          <div style="font-family:'DM Serif Display',serif;font-size:22px;margin-bottom:4px">Old Emails <span style="font-size:14px;color:#F59E0B;font-family:'DM Sans',sans-serif;font-weight:600">(3+ days old)</span></div>
+          <div style="font-size:13px;color:#64748B;margin-bottom:6px">These emails were in the inbox when the agent connected. They're separated so new emails get priority.</div>
+          <div style="font-size:13px;color:#EF4444;font-weight:500;margin-bottom:20px">⚠️ These senders haven't heard back — follow up as soon as possible.</div>
+          <div id="archive-items"></div>
         </div>
       </div>
 
-      <!-- CRM -->
-      <div id="pane-crm" style="display:none;flex:1;overflow-y:auto;padding:32px">
-        <div style="max-width:920px">
-          <div class="page-title">Patient CRM</div>
-          <div class="page-sub">Every person the agent has communicated with. Follow-ups auto-queue after 14 days of silence.</div>
-          <div id="crm-stats" style="display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin:20px 0"></div>
-          <div class="card" style="padding:16px">
-            <div style="font-size:13px;font-weight:600;margin-bottom:10px">Add Past Patient Manually</div>
-            <div style="display:flex;gap:8px;flex-wrap:wrap">
-              <input id="crm-email" placeholder="Email address *" style="flex:2;min-width:180px;padding:9px 12px;border-radius:var(--r-sm);border:1px solid var(--border)"/>
-              <input id="crm-name" placeholder="Name" style="flex:1;min-width:130px;padding:9px 12px;border-radius:var(--r-sm);border:1px solid var(--border)"/>
-              <input id="crm-notes" placeholder="Notes (optional)" style="flex:2;min-width:180px;padding:9px 12px;border-radius:var(--r-sm);border:1px solid var(--border)"/>
-              <button class="btn btn-primary" onclick="addCRM()">Add Contact</button>
-            </div>
-          </div>
-          <div id="crm-list"></div>
-        </div>
-      </div>
-
-      <!-- VOICE PROFILE -->
-      <div id="pane-voice" style="display:none;flex:1;overflow-y:auto;padding:32px">
-        <div style="max-width:660px">
-          <div class="page-title">Voice Profile</div>
-          <div class="page-sub">Train the agent to write exactly like Expert Physio. The more approved samples you add, the more natural every reply sounds.</div>
-          <div class="card" style="margin-top:24px">
+      <!-- VOICE TAB -->
+      <div id="pane-Voice" style="display:none;flex:1;overflow-y:auto;padding:28px">
+        <div style="max-width:680px">
+          <div style="font-family:'DM Serif Display',serif;font-size:22px;margin-bottom:4px">Voice Profile</div>
+          <div style="font-size:13px;color:#64748B;margin-bottom:20px">Train the agent to write exactly like Expert Physio. The AI uses this on every reply it generates.</div>
+          <div class="card">
             <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px">
-              <div style="font-family:'Cormorant Garamond',serif;font-size:19px;font-weight:500">Voice Guidelines</div>
-              <button class="btn btn-ghost btn-sm" onclick="toggleGuidelines()">Edit</button>
+              <div style="font-size:14px;font-weight:700">🎙 Voice Guidelines</div>
+              <button class="btn btn-gray" style="padding:5px 12px;font-size:12px" onclick="toggleEditGuidelines()">Edit</button>
             </div>
-            <div id="guidelines-view" style="font-size:13px;color:var(--muted);line-height:1.85;white-space:pre-wrap;background:var(--sage-pale);padding:13px;border-radius:var(--r-sm)">Loading...</div>
-            <div id="guidelines-edit" style="display:none;margin-top:10px">
-              <textarea id="guidelines-ta" style="width:100%;min-height:200px;padding:12px;border:1px solid var(--border);border-radius:var(--r-sm);line-height:1.7;resize:vertical;font-size:13px"></textarea>
-              <div style="display:flex;gap:8px;margin-top:8px">
-                <button class="btn btn-success btn-sm" onclick="saveGuidelines()">Save</button>
-                <button class="btn btn-ghost btn-sm" onclick="toggleGuidelines()">Cancel</button>
+            <div id="guidelines-view" style="font-size:13px;color:#374151;line-height:1.8;white-space:pre-wrap;background:#F8FAFC;padding:12px;border-radius:8px">Loading…</div>
+            <div id="guidelines-edit" style="display:none">
+              <textarea id="guidelines-textarea" style="width:100%;min-height:200px;padding:12px;border:1px solid #D1D5DB;border-radius:8px;font-size:13px;line-height:1.7;resize:vertical"></textarea>
+              <div style="display:flex;gap:6px;margin-top:8px">
+                <button class="btn btn-green" style="padding:7px 16px;font-size:12px" onclick="saveGuidelines()">Save</button>
+                <button class="btn btn-gray" style="padding:7px 12px;font-size:12px" onclick="toggleEditGuidelines()">Cancel</button>
               </div>
             </div>
           </div>
           <div class="card">
-            <div style="font-family:'Cormorant Garamond',serif;font-size:19px;font-weight:500;margin-bottom:4px">Approved Reply Samples</div>
-            <div style="font-size:12.5px;color:var(--stone-lt);margin-bottom:14px">Paste real replies the team has written. The AI uses these to match their exact voice.</div>
+            <div style="font-size:14px;font-weight:700;margin-bottom:6px">✍️ Approved Reply Samples</div>
+            <div style="font-size:12px;color:#6B7280;margin-bottom:14px">Paste real approved replies. The AI matches this exact style on every email it writes.</div>
             <div id="voice-samples"></div>
-            <textarea id="new-sample" placeholder="Paste an approved reply example here..." style="width:100%;min-height:100px;padding:12px;border:1px solid var(--border);border-radius:var(--r-sm);line-height:1.65;resize:vertical;margin-bottom:10px;font-size:13px"></textarea>
-            <button class="btn btn-primary btn-sm" onclick="addSample()">+ Add Sample</button>
+            <textarea id="new-sample-input" placeholder="Paste an approved reply example here…" style="width:100%;min-height:100px;padding:12px;border:1px solid #D1D5DB;border-radius:8px;font-size:13px;line-height:1.65;resize:vertical;margin-bottom:8px"></textarea>
+            <button class="btn btn-blue" onclick="addSample()">+ Add Sample</button>
           </div>
         </div>
       </div>
 
-      <!-- DEMO INBOX -->
-      <div id="pane-inbox" style="display:none;flex:1;overflow:hidden">
-        <div style="width:288px;border-right:1px solid var(--border);overflow-y:auto;background:var(--white);flex-shrink:0;height:100%">
-          <div style="padding:12px 16px;border-bottom:1px solid var(--border-lt);font-size:10.5px;font-weight:700;color:var(--sage-deep);letter-spacing:.08em;text-transform:uppercase">Demo Emails</div>
+      <!-- INBOX TAB -->
+      <div id="pane-Inbox" style="display:none;flex:1;overflow:hidden">
+        <div style="width:296px;border-right:1px solid #E5E7EB;overflow-y:auto;background:#fff;flex-shrink:0;height:100%">
+          <div style="padding:11px 14px 9px;border-bottom:1px solid #F3F4F6;font-size:11px;font-weight:700;color:#6B7280;letter-spacing:.5px">DEMO EMAILS</div>
           <div id="email-list"></div>
         </div>
         <div id="email-detail" style="flex:1;overflow-y:auto;padding:26px;display:flex;align-items:center;justify-content:center">
-          <div style="text-align:center;color:var(--stone-lt)">
-            <div style="font-size:40px;margin-bottom:10px">&#x1F4EC;</div>
-            <div style="font-size:14px;font-weight:500">Select an email to read</div>
-            <div style="font-size:12px;margin-top:4px;color:var(--stone-lt)">The AI analyses it instantly</div>
-          </div>
+          <div style="text-align:center;color:#9CA3AF"><div style="font-size:44px;margin-bottom:10px">📬</div><div style="font-size:14px">Select an email to read and reply</div></div>
         </div>
       </div>
 
-      <!-- COMPOSE -->
-      <div id="pane-compose" style="display:none;flex:1;overflow-y:auto;padding:32px">
+      <!-- COMPOSE TAB -->
+      <div id="pane-Compose" style="display:none;flex:1;overflow-y:auto;padding:30px">
         <div style="max-width:620px">
-          <div class="page-title">Compose Email</div>
-          <div class="page-sub">Describe what you want to send — the agent writes it in Expert Physio's exact voice.</div>
-          <div style="margin-top:24px">
-            <textarea id="compose-input" placeholder='e.g. "Email Sarah Mitchell to reschedule her Thursday appointment to Tuesday at 11am"' style="width:100%;min-height:90px;padding:14px;border:1px solid var(--border);border-radius:var(--r);line-height:1.65;resize:vertical;margin-bottom:12px;font-size:13px"></textarea>
-            <button class="btn btn-primary" id="compose-btn" onclick="generateEmail()">&#x2728; Generate Email</button>
-            <div id="compose-spinner" style="display:none;margin-top:12px;align-items:center;gap:8px;color:var(--muted);font-size:13px"><span class="spinner"></span>Composing...</div>
-          </div>
-          <div id="composed-email" style="display:none;margin-top:20px">
+          <div style="font-family:'DM Serif Display',serif;font-size:22px;margin-bottom:4px">Compose Email</div>
+          <div style="font-size:13px;color:#64748B;margin-bottom:20px">Describe what you want sent — the agent writes it in Expert Physio's exact voice.</div>
+          <textarea id="compose-input" placeholder='e.g. "Email Sarah Mitchell to reschedule her Thursday appointment to Tuesday at 11am"' style="width:100%;min-height:90px;padding:14px;border:1px solid #D1D5DB;border-radius:10px;font-size:13px;line-height:1.6;resize:vertical;margin-bottom:14px"></textarea>
+          <button class="btn btn-blue" id="compose-btn" onclick="generateEmail()">✨ Generate Email</button>
+          <div id="compose-spinner" style="display:none;margin-top:10px;display:flex;align-items:center;gap:8px;color:#6B7280;font-size:13px;display:none"><div class="spinner"></div>Composing in Expert Physio's voice…</div>
+          <div id="composed-email" style="display:none;margin-top:16px">
             <div class="card" style="padding:0;overflow:hidden">
-              <div style="padding:10px 16px;border-bottom:1px solid var(--border-lt);display:flex;gap:10px;align-items:center"><span style="font-size:10px;font-weight:700;color:var(--stone-lt);width:54px;flex-shrink:0;letter-spacing:.06em;text-transform:uppercase">To</span><input id="c-to" style="flex:1;border:none;font-size:13px;padding:0"/></div>
-              <div style="padding:10px 16px;border-bottom:1px solid var(--border-lt);display:flex;gap:10px;align-items:center"><span style="font-size:10px;font-weight:700;color:var(--stone-lt);width:54px;flex-shrink:0;letter-spacing:.06em;text-transform:uppercase">Subject</span><input id="c-subject" style="flex:1;border:none;font-size:13px;padding:0"/></div>
-              <div style="padding:12px 16px"><div style="font-size:10px;font-weight:700;color:var(--stone-lt);margin-bottom:8px;letter-spacing:.06em;text-transform:uppercase">Body</div><textarea id="c-body" style="width:100%;min-height:200px;border:none;font-size:13px;line-height:1.75;resize:vertical;padding:0"></textarea></div>
+              <div style="padding:10px 16px;border-bottom:1px solid #F1F5F9;display:flex;gap:10px;align-items:center"><span style="font-size:10px;font-weight:700;color:#94A3B8;width:54px;flex-shrink:0">TO</span><input id="c-to" style="flex:1;border:none;font-size:13.5px;color:#1E293B;padding:0"/></div>
+              <div style="padding:10px 16px;border-bottom:1px solid #F1F5F9;display:flex;gap:10px;align-items:center"><span style="font-size:10px;font-weight:700;color:#94A3B8;width:54px;flex-shrink:0">SUBJECT</span><input id="c-subject" style="flex:1;border:none;font-size:13.5px;color:#1E293B;padding:0"/></div>
+              <div style="padding:12px 16px"><div style="font-size:10px;font-weight:700;color:#94A3B8;margin-bottom:8px">BODY</div><textarea id="c-body" style="width:100%;min-height:200px;border:none;font-size:13.5px;line-height:1.75;color:#1E293B;resize:vertical;padding:0"></textarea></div>
             </div>
             <div style="display:flex;gap:8px;margin-top:12px">
-              <button class="btn btn-success" onclick="sendComposed()">Send via Gmail</button>
-              <button class="btn btn-ghost" onclick="discardComposed()">Discard</button>
+              <button class="btn btn-green" onclick="sendComposed()">📤 Send via Gmail</button>
+              <button class="btn btn-gray" onclick="discardComposed()">Discard</button>
             </div>
           </div>
         </div>
       </div>
 
-      <!-- SENT LOG -->
-      <div id="pane-sent" style="display:none;flex:1;overflow-y:auto;padding:32px">
+      <!-- SENT LOG TAB -->
+      <div id="pane-Sent" style="display:none;flex:1;overflow-y:auto;padding:28px">
         <div style="max-width:740px">
-          <div class="page-title">Sent Log</div>
-          <div class="page-sub">Full record of every email sent — content, AI analysis, confidence score, timestamp.</div>
-          <div id="sent-list" style="margin-top:24px"><div style="font-size:13px;color:var(--stone-lt);font-style:italic">No emails sent yet.</div></div>
+          <div style="font-family:'DM Serif Display',serif;font-size:22px;margin-bottom:4px">Sent Log</div>
+          <div style="font-size:13px;color:#64748B;margin-bottom:20px">Every email sent — full content, AI analysis, confidence score.</div>
+          <div id="sent-log-items"><div style="font-size:13px;color:#9CA3AF">No emails sent yet.</div></div>
         </div>
       </div>
 
@@ -610,386 +912,408 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 </div>
 
 <script>
-// ── STATE
-var currentTab = 'autopilot';
-var D = {};
-var editingGuidelines = false;
-var notifOpen = false;
-var selectedEmail = null;
+let currentTab = 'Autopilot';
+let serverData = {};
+let editingGuidelines = false;
+let notifPanelOpen = false;
+let selectedEmailId = null;
 
-var DEMO = [
-  {id:1,name:'Sarah Mitchell',from:'sarah.mitchell@gmail.com',subject:'Appointment Cancellation - Thursday 2pm',body:'Hi, I need to cancel my appointment this Thursday at 2pm. I have a conflict at work. Can we reschedule? Any time Tuesday or Wednesday works. Thanks, Sarah',time:'9:14 AM',status:'unread',tag:'cancellation'},
-  {id:2,name:'ICBC Claims',from:'icbc.claims@icbc.com',subject:'Claim #4892-B: Treatment Authorization Required',body:'Please submit updated treatment plan for claimant John Patel (Claim #4892-B). Authorization is required before proceeding with further sessions. Please respond within 5 business days.',time:'8:30 AM',status:'unread',tag:'icbc'},
-  {id:3,name:'Dr. Angela Lee',from:'drlee@familyclinic.ca',subject:'Referral: Marcus Huang - Lower Back Pain',body:'I am referring Marcus Huang, 42, for physiotherapy following a lumbar strain. Three weeks of lower back pain. Please book at your earliest convenience.',time:'Yesterday',status:'read',tag:'referral'},
-  {id:4,name:'Kevin Tran',from:'kevin.tran88@hotmail.com',subject:'Question about my invoice',body:'Hi there, I received an invoice for $180 but think my insurance covers 80%. Can you resubmit to Pacific Blue Cross? Policy PBC-2291-TK.',time:'Yesterday',status:'read',tag:'billing'},
-  {id:5,name:'Amanda Shore',from:'amanda.shore@gmail.com',subject:'New Patient Inquiry',body:'Hello, I found you on Google and wondering if you accept new patients? I have a rotator cuff injury. Available weekday mornings. Do you direct bill to MSP?',time:'Mon',status:'read',tag:'new-patient'},
+const DEMO_EMAILS = [
+  {id:1,name:'Sarah Mitchell',from:'sarah.mitchell@gmail.com',subject:'Appointment Cancellation - Thursday 2pm',preview:'Hi, I need to cancel my appointment...',body:'Hi, I need to cancel my appointment this Thursday at 2pm. I have a conflict at work. Can we reschedule? Any time Tuesday or Wednesday works. Thanks, Sarah',time:'9:14 AM',status:'unread',tag:'cancellation'},
+  {id:2,name:'ICBC Claims',from:'icbc.claims@icbc.com',subject:'Claim #4892-B: Treatment Authorization Required',preview:'Please submit updated treatment plan...',body:'Please submit updated treatment plan for claimant John Patel (Claim #4892-B). Authorization is required before proceeding with further sessions. Please respond within 5 business days.',time:'8:30 AM',status:'unread',tag:'icbc'},
+  {id:3,name:'Dr. Angela Lee',from:'drlee@familyclinic.ca',subject:'Referral: Marcus Huang - Lower Back Pain',preview:'I am referring Marcus Huang, 42...',body:'I am referring Marcus Huang, 42, for physiotherapy following a lumbar strain. Three weeks of lower back pain. Please book at your earliest convenience.',time:'Yesterday',status:'read',tag:'referral'},
+  {id:4,name:'Kevin Tran',from:'kevin.tran88@hotmail.com',subject:'Question about my invoice',preview:'Hi there, I received an invoice...',body:'Hi there, I received an invoice for $180 but think my insurance covers 80%. Can you resubmit to Pacific Blue Cross? Policy PBC-2291-TK.',time:'Yesterday',status:'read',tag:'billing'},
+  {id:5,name:'Amanda Shore',from:'amanda.shore@gmail.com',subject:'New Patient Inquiry',preview:'Hello, I found you on Google...',body:'Hello, I found you on Google and wondering if you accept new patients? I have a rotator cuff injury. Available weekday mornings. Do you direct bill to MSP?',time:'Mon',status:'read',tag:'new-patient'},
 ];
-var TAGS = {
-  cancellation:{bg:'#FCF0EE',c:'#B85A48',l:'Cancellation'},
-  icbc:{bg:'#EEF2FA',c:'#4A7AB5',l:'ICBC'},
-  referral:{bg:'#EEF4EE',c:'#3A5C3D',l:'Referral'},
-  billing:{bg:'#FAF4EA',c:'#B87A38',l:'Billing'},
-  'new-patient':{bg:'#EEF6FA',c:'#3A7A9E',l:'New Patient'}
-};
-var CRM_LABELS = {
-  active:{l:'Active',bg:'#EEF4EE',c:'#3A5C3D'},
-  silent:{l:'Silent',bg:'#F5E8D0',c:'#C4913A'},
-  followup:{l:'Follow-up Sent',bg:'#E4EEF8',c:'#4A7AB5'},
-  booked:{l:'Booked',bg:'#EEF4EE',c:'#3A5C3D'},
-  lost:{l:'Lost',bg:'#F2EDE8',c:'#9C9590'},
-  opted_out:{l:'Opted Out',bg:'#F2EDE8',c:'#9C9590'}
-};
+const TAGS = {cancellation:{bg:'#FFF0F0',color:'#C0392B',label:'Cancellation'},icbc:{bg:'#EEF2FF',color:'#4338CA',label:'ICBC'},referral:{bg:'#F0FFF4',color:'#166534',label:'Referral'},billing:{bg:'#FFFBEB',color:'#92400E',label:'Billing'},'new-patient':{bg:'#F0F9FF',color:'#0369A1',label:'New Patient'}};
+let draftReplies = {};
 
-// ── HELPERS
-function el(id){ return document.getElementById(id); }
-function esc(s){ return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
-function showToast(m){ el('toast-msg').textContent=m; el('toast').style.display='flex'; setTimeout(function(){el('toast').style.display='none';},3500); }
-function hideToast(){ el('toast').style.display='none'; }
-function showErr(m){ el('err-msg').textContent=m; el('err-bar').style.display='flex'; }
-function hideErr(){ el('err-bar').style.display='none'; }
+function showToast(msg){const t=document.getElementById('toast');document.getElementById('toast-msg').textContent=msg;t.style.display='flex';setTimeout(()=>t.style.display='none',3500);}
+function hideToast(){document.getElementById('toast').style.display='none';}
+function showErr(msg){const b=document.getElementById('err-banner');document.getElementById('err-msg').textContent=msg;b.style.display='flex';}
+function hideErr(){document.getElementById('err-banner').style.display='none';}
 
-// ── TABS
 function showTab(name){
-  document.querySelectorAll('[id^="pane-"]').forEach(function(p){ p.style.display='none'; });
-  document.querySelectorAll('.tab-btn').forEach(function(b){ b.classList.remove('active'); });
-  var pane = el('pane-'+name);
-  if(pane) pane.style.display = (name==='inbox') ? 'flex' : 'block';
-  var btn = el('tab-'+name);
-  if(btn) btn.classList.add('active');
-  currentTab = name;
-  if(name==='inbox') renderEmailList();
-  if(name==='crm') renderCRM();
+  document.querySelectorAll('[id^="pane-"]').forEach(p=>p.style.display='none');
+  document.querySelectorAll('.tab-btn').forEach(b=>b.classList.remove('active'));
+  const pane=document.getElementById('pane-'+name);
+  if(pane)pane.style.display=name==='Inbox'?'flex':'block';
+  const btn=document.getElementById('tab-'+name);
+  if(btn)btn.classList.add('active');
+  currentTab=name;
+  if(name==='Inbox')renderEmailList();
 }
 
-// ── API
-function apiFetch(path, opts){
-  return fetch(path, Object.assign({headers:{'Content-Type':'application/json'}}, opts||{}))
-    .then(function(r){ return r.json().then(function(d){ if(!r.ok) throw new Error(d.error||'Error'); return d; }); });
-}
-function callClaude(msg){
-  return apiFetch('/api/claude',{method:'POST',body:JSON.stringify({model:'claude-sonnet-4-6',max_tokens:900,system:'You are the AI assistant for Expert Physio clinic in Burnaby, BC. Tone: warm, professional, concise. Sign as "Expert Physio Team".',messages:[{role:'user',content:msg}]})})
-    .then(function(d){ var t=(d.content||[]).filter(function(b){return b.type==='text';}).map(function(b){return b.text;}).join('\n').trim(); if(!t)throw new Error('Empty'); return t; });
+async function apiFetch(path,opts={}){
+  const r=await fetch(path,{headers:{'Content-Type':'application/json'},...opts});
+  if(!r.ok){const e=await r.json().catch(()=>({}));throw new Error(e.error||'Request failed');}
+  return r.json();
 }
 
-// ── REFRESH
-function refreshData(){
-  Promise.all([
-    apiFetch('/api/status'), apiFetch('/api/log'), apiFetch('/api/review'),
-    apiFetch('/api/queue'), apiFetch('/api/sent'), apiFetch('/api/voice'),
-    apiFetch('/api/archive'), apiFetch('/api/notifications'),
-    apiFetch('/api/crm'), apiFetch('/api/crm/stats')
-  ]).then(function(results){
-    D = {status:results[0],log:results[1],review:results[2],queue:results[3],sent:results[4],voice:results[5],archive:results[6],notifs:results[7],crm:results[8],crmStats:results[9]};
-    render();
-  }).catch(function(e){ console.error('Refresh error:', e.message); });
+async function callClaude(msg){
+  const d=await apiFetch('/api/claude',{method:'POST',body:JSON.stringify({model:'claude-sonnet-4-6',max_tokens:900,system:'You are the AI assistant for Expert Physio clinic in Burnaby, BC. Tone: warm, professional, concise. Sign as "Expert Physio Team".',messages:[{role:'user',content:msg}]})});
+  const t=(d.content||[]).filter(b=>b.type==='text').map(b=>b.text).join('\\n').trim();
+  if(!t)throw new Error('Empty response');
+  return t;
 }
 
-function setBadge(id, n, show){
-  var el2 = el('badge-'+id);
-  if(!el2) return;
-  el2.textContent = n;
-  el2.style.display = show ? 'inline' : 'none';
+async function refreshData(){
+  try{
+    const [status,log,review,queue,sent,voice,archive,notifications]=await Promise.all([
+      apiFetch('/api/status'),apiFetch('/api/log'),apiFetch('/api/review'),
+      apiFetch('/api/queue'),apiFetch('/api/sent'),apiFetch('/api/voice'),
+      apiFetch('/api/archive'),apiFetch('/api/notifications'),
+    ]);
+    serverData={status,log,review,queue,sent,voice,archive,notifications};
+    updateUI();
+  }catch(e){console.error('Refresh:',e.message);}
 }
 
-function render(){
-  var s = D.status; if(!s) return;
+function updateUI(){
+  const {status,log,review,queue,sent,voice,archive,notifications}=serverData;
+  if(!status)return;
 
-  // Status bar
-  var dot = el('status-dot'); var txt = el('status-text');
-  if(dot){ dot.style.background = s.connected ? 'var(--sage)' : 'var(--red)'; dot.style.animation = s.connected ? 'pulse 2s infinite' : 'none'; }
-  if(txt){ txt.textContent = s.connected ? 'Autopilot running — 2-step review active' : 'Gmail not connected'; txt.style.color = s.connected ? 'var(--sage-deep)' : 'var(--muted)'; }
+  // Header status
+  const sl=document.getElementById('status-line');
+  if(sl){sl.style.color=status.connected?'#6EE7B7':'#FCA5A5';sl.innerHTML=\`<span style="width:6px;height:6px;border-radius:50%;background:\${status.connected?'#6EE7B7':'#FCA5A5'};display:inline-block;margin-right:4px;\${status.connected?'animation:pulse 2s infinite':''}"></span>\${status.connected?'Autopilot v3 running — 2-step review active':'Gmail not connected'}\`;}
 
-  // Connect area
-  var ca = el('connect-area');
-  if(ca) ca.innerHTML = s.connected ? '' : '<a href="/auth/login" style="padding:7px 16px;background:var(--sage);color:#fff;border-radius:var(--r-sm);font-size:12.5px;font-weight:500;text-decoration:none">Connect Gmail</a>';
+  // Connect btn
+  const cba=document.getElementById('connect-btn-area');
+  if(cba)cba.innerHTML=status.connected?'':\`<a href="/auth/login" style="padding:7px 16px;background:#0EA5E9;color:#fff;border-radius:8px;font-size:12px;font-weight:600;text-decoration:none">Connect Gmail →</a>\`;
 
   // Connect banner
-  var cb = el('connect-banner');
-  if(cb) cb.innerHTML = s.connected ? '' : '<div style="background:var(--amber-lt);border:1px solid #E8D0A8;border-radius:var(--r);padding:18px;display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:16px"><div><div style="font-weight:600;color:var(--amber);margin-bottom:3px">Gmail not connected</div><div style="font-size:12.5px;color:var(--stone)">Click Connect Gmail in the top right to start the autopilot.</div></div><a href="/auth/login" style="padding:9px 18px;background:var(--amber);color:#fff;border-radius:var(--r-sm);font-size:12.5px;font-weight:500;text-decoration:none;white-space:nowrap;flex-shrink:0">Connect Gmail</a></div>';
+  const cb=document.getElementById('connect-banner');
+  if(cb)cb.innerHTML=status.connected?'':\`<div style="background:#FFF7ED;border:1px solid #FED7AA;border-radius:12px;padding:20px;margin-bottom:20px;display:flex;align-items:center;justify-content:space-between;gap:16px"><div><div style="font-weight:600;color:#92400E;margin-bottom:4px">Gmail not connected</div><div style="font-size:13px;color:#B45309">Click Connect Gmail in the top right to start the autopilot.</div></div><a href="/auth/login" style="padding:10px 20px;background:#F59E0B;color:#fff;border-radius:8px;font-size:13px;font-weight:600;text-decoration:none;white-space:nowrap">Connect Gmail →</a></div>\`;
 
   // Sidebar stats
-  var ss = el('sidebar-stats');
-  if(ss) ss.innerHTML = '&#x26A1; '+(s.sentToday||0)+' auto-sent<br>&#x23F1; '+(s.queueCount||0)+' in queue<br>&#x26A0; '+(s.reviewCount||0)+' for review<br>&#x1F465; '+(s.crmTotal||0)+' contacts';
+  const ss=document.getElementById('sidebar-stats');
+  if(ss)ss.innerHTML=\`<div>⚡ \${status.sentToday||0} auto-sent today</div><div>⏱ \${status.queueCount||0} in send queue</div><div>⚠️ \${status.reviewCount||0} for review</div><div>📁 \${status.archiveCount||0} old emails</div><div>🔔 \${status.unreadNotifications||0} unread alerts</div>\`;
 
   // Badges
-  var aq = (D.queue||[]).filter(function(q){return !q.cancelled;}).length;
-  setBadge('autopilot', aq, aq>0);
-  setBadge('queue', s.reviewCount||0, (s.reviewCount||0)>0);
-  setBadge('archive', s.archiveCount||0, (s.archiveCount||0)>0);
-  setBadge('crm', s.crmSilent||0, (s.crmSilent||0)>0);
-  setBadge('inbox', DEMO.filter(function(e){return e.status==='unread';}).length, DEMO.filter(function(e){return e.status==='unread';}).length>0);
+  const setB=(id,n,show)=>{const el=document.getElementById(id);if(el){el.textContent=n;el.style.display=show?'inline':'none';}};
+  setB('badge-Autopilot',queue?.filter(q=>!q.cancelled).length||0,(queue?.filter(q=>!q.cancelled).length||0)>0);
+  setB('badge-Queue',status.reviewCount||0,(status.reviewCount||0)>0);
+  setB('badge-Archive',status.archiveCount||0,(status.archiveCount||0)>0);
 
   // Bell
-  var un = s.unreadNotifications||0;
-  var bb = el('bell-badge'); if(bb){bb.textContent=un;bb.style.display=un>0?'inline':'none';}
+  const unreadN=status.unreadNotifications||0;
+  const bellBadge=document.getElementById('bell-badge');
+  if(bellBadge){bellBadge.textContent=unreadN;bellBadge.style.display=unreadN>0?'inline':'none';}
+  const bellBtn=document.getElementById('bell-btn');
+  if(bellBtn&&unreadN>0)bellBtn.style.animation='bellShake 1s ease';
 
   // Header badges
-  var hb = '';
-  if((s.reviewCount||0)>0) hb+='<span style="background:var(--red-lt);color:var(--red);border:1px solid #E8C0B8;border-radius:20px;font-size:11px;font-weight:600;padding:3px 10px">&#x26A0; '+s.reviewCount+' for review</span>';
-  if(aq>0) hb+='<span style="background:var(--amber-lt);color:var(--amber);border:1px solid #E8D0A8;border-radius:20px;font-size:11px;font-weight:600;padding:3px 10px;margin-left:6px">&#x23F1; '+aq+' sending</span>';
-  var hbel = el('header-badges'); if(hbel) hbel.innerHTML=hb;
+  let hb='';
+  if(status.reviewCount>0)hb+=\`<span style="background:#EF4444;color:#fff;border-radius:20px;font-size:11px;font-weight:700;padding:3px 10px;margin-right:6px">⚠️ \${status.reviewCount} for review</span>\`;
+  if((queue?.filter(q=>!q.cancelled).length||0)>0)hb+=\`<span style="background:#F59E0B;color:#fff;border-radius:20px;font-size:11px;font-weight:700;padding:3px 10px">⏱ sending soon</span>\`;
+  const hbEl=document.getElementById('header-badges');
+  if(hbEl)hbEl.innerHTML=hb;
 
-  // Queue panel
-  var qp = el('queue-panel'); var qi = el('queue-items');
-  var aqItems = (D.queue||[]).filter(function(q){return !q.cancelled;});
-  if(qp) qp.style.display = aqItems.length>0 ? 'block' : 'none';
-  if(qi) qi.innerHTML = aqItems.map(function(item){
-    var sec = Math.max(0,Math.round((new Date(item.sendAt||Date.now()+300000)-Date.now())/1000));
-    var m = Math.floor(sec/60), sc = sec%60;
-    return '<div style="padding:10px 12px;background:var(--white);border-radius:var(--r-sm);margin-bottom:8px;border:1px solid #E8D0A8;display:flex;align-items:center;justify-content:space-between;gap:12px"><div style="flex:1;min-width:0"><div style="font-size:13px;font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+esc(item.email&&item.email.subject||'')+'</div><div style="font-size:11.5px;color:var(--muted);margin-top:2px">To: '+esc(item.email&&item.email.from||'')+'</div></div><div style="display:flex;align-items:center;gap:8px;flex-shrink:0"><span style="font-size:12px;color:var(--amber);font-weight:600">'+m+':'+(sc<10?'0':'')+sc+'</span><button onclick="cancelSend(\''+item.id+'\')" class="btn btn-amber btn-sm">Cancel</button></div></div>';
+  // Send queue
+  const sqPanel=document.getElementById('send-queue-panel');
+  const sqItems=document.getElementById('send-queue-items');
+  const activeQ=(queue||[]).filter(q=>!q.cancelled);
+  if(sqPanel)sqPanel.style.display=activeQ.length>0?'block':'none';
+  if(sqItems)sqItems.innerHTML=activeQ.map(item=>{
+    const secsLeft=Math.max(0,Math.round((new Date(item.sendAt||Date.now()+300000)-Date.now())/1000));
+    const m=Math.floor(secsLeft/60),s=secsLeft%60;
+    return \`<div style="padding:10px 12px;background:#fff;border-radius:8px;margin-bottom:8px;border:1px solid #FDE68A">
+      <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:8px">
+        <div style="flex:1;min-width:0"><div style="font-size:13px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">\${item.email?.subject||''}</div><div style="font-size:11px;color:#6B7280;margin-top:2px">To: \${item.email?.from||''}</div></div>
+        <div style="display:flex;align-items:center;gap:8px;flex-shrink:0"><span style="font-size:12px;color:#D97706;font-weight:600">Sending in \${m}:\${String(s).padStart(2,'0')}</span><button onclick="cancelSend('\${item.id}')" class="btn btn-amber" style="padding:4px 10px;font-size:11px">Cancel</button></div>
+      </div>
+      \${item.understanding?
+        \`<div style="font-size:11px;color:#6B7280;background:#F8FAFC;padding:8px;border-radius:6px;border:1px solid #E5E7EB">
+          <span class="step-badge" style="margin-right:6px">Step 1</span>Intent: \${item.understanding.intent||''} · Sentiment: \${item.understanding.sentiment||''} · Confidence: \${item.classification?.confidence||0}%
+        </div>\`:''
+      }
+    </div>\`;
   }).join('');
 
   // Live log
-  var ll = el('live-log');
-  if(ll&&D.log&&D.log.length>0){
-    ll.innerHTML = D.log.slice(0,15).map(function(item,i){
-      var dc = item.type==='sent'?'var(--sage)':item.type==='review'?'var(--red)':item.type==='queued'?'var(--amber)':item.type==='archive'?'#8B5CF6':item.type==='error'?'var(--red)':'var(--stone-lt)';
-      return '<div style="display:flex;gap:12px;padding-bottom:10px;padding-left:14px;margin-left:6px;border-left:1px solid var(--border-lt);position:relative"><div style="width:6px;height:6px;border-radius:50%;background:'+dc+';position:absolute;left:-4px;top:5px"></div><div style="font-size:11px;color:var(--stone-lt);white-space:nowrap;min-width:46px;padding-top:1px">'+esc(item.time)+'</div><div style="font-size:12.5px;color:var(--muted);line-height:1.55">'+esc(item.msg)+'</div></div>';
+  const ll=document.getElementById('live-log');
+  if(ll&&log&&log.length>0){
+    ll.innerHTML=log.slice(0,15).map((item,i)=>{
+      const dotColor=item.type==='sent'?'#059669':item.type==='review'?'#EF4444':item.type==='queued'?'#F59E0B':item.type==='archive'?'#8B5CF6':item.type==='error'?'#DC2626':'#0EA5E9';
+      return \`<div style="display:flex;gap:12px;padding-bottom:10px;padding-left:14px;margin-left:6px;border-left:2px solid \${i===Math.min(log.length,15)-1?'transparent':'#E5E7EB'};position:relative">
+        <div style="width:6px;height:6px;border-radius:50%;background:\${dotColor};position:absolute;left:-4px;top:4px"></div>
+        <div style="font-size:11px;color:#9CA3AF;white-space:nowrap;min-width:48px">\${item.time}</div>
+        <div style="font-size:12px;color:#374151;line-height:1.5">\${item.msg}</div>
+      </div>\`;
     }).join('');
   }
 
   // Review queue
-  var rl = el('review-list');
-  if(rl){
-    if(!D.review||D.review.length===0){
-      rl.innerHTML='<div style="background:var(--sage-pale);border:1px solid rgba(92,122,95,.2);border-radius:var(--r);padding:24px;text-align:center"><div style="font-size:28px;margin-bottom:8px">&#x2713;</div><div style="font-family:\'Cormorant Garamond\',serif;font-size:18px;color:var(--sage-deep)">Queue is clear</div><div style="font-size:13px;color:var(--muted);margin-top:4px">The agent is handling everything automatically.</div></div>';
-    } else {
-      rl.innerHTML = D.review.map(function(item){
-        var u = item.understanding||{};
-        return '<div class="card" style="padding:0;overflow:hidden;border-color:var(--border)">'
-          +'<div style="padding:14px 16px;cursor:pointer" onclick="toggleEl(\'rb-'+item.id+'\')">'
-          +'<div style="display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:8px">'
-          +'<div style="flex:1;min-width:0"><div style="font-size:13.5px;font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+esc(item.email&&item.email.subject||'')+'</div>'
-          +'<div style="font-size:12px;color:var(--muted);margin-top:2px">From: '+esc(item.email&&item.email.from||'')+'</div></div>'
-          +'<div style="display:flex;gap:6px;flex-shrink:0"><button onclick="event.stopPropagation();discardReview(\''+item.id+'\')" class="btn btn-danger btn-sm">Discard</button><span style="font-size:12px;color:var(--stone-lt);padding:0 2px">&#x25BC;</span></div></div>'
-          +(u.intent?'<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:6px"><span class="step-badge">Intent: '+esc(u.intent)+'</span><span class="tag" style="background:var(--amber-lt);color:var(--amber)">Urgency: '+esc(u.urgency||'')+'</span><span class="tag" style="background:'+((item.classification&&item.classification.confidence||0)>=80?'var(--sage-pale)':'var(--red-lt)')+';color:'+((item.classification&&item.classification.confidence||0)>=80?'var(--sage-deep)':'var(--red)')+'">'+((item.classification&&item.classification.confidence)||0)+'% confidence</span></div>':'')
-          +'<div style="font-size:12px;color:var(--red);font-weight:500">Held: '+esc(item.holdReason||'')+'</div></div>'
-          +'<div id="rb-'+item.id+'" style="display:none;padding:16px;border-top:1px solid var(--border-lt);background:var(--cream)">'
-          +'<div style="font-size:13px;color:var(--muted);background:var(--white);border:1px solid var(--border);border-radius:var(--r-sm);padding:12px;margin-bottom:12px;line-height:1.7">'+esc(item.email&&item.email.body||'')+'</div>'
-          +'<div style="font-size:10.5px;font-weight:700;color:var(--stone-lt);margin-bottom:6px;letter-spacing:.06em;text-transform:uppercase">AI Draft — edit before sending</div>'
-          +'<textarea id="rd-'+item.id+'" style="width:100%;min-height:150px;padding:11px;border:1px solid var(--border);border-radius:var(--r-sm);font-size:13px;line-height:1.7;resize:vertical;margin-bottom:10px">'+esc(item.draftReply||'')+'</textarea>'
-          +'<button class="btn btn-success" onclick="approveReview(\''+item.id+'\')">&#x2713; Approve &amp; Send</button>'
-          +'</div></div>';
-      }).join('');
+  const rq=document.getElementById('review-queue-items');
+  if(rq){
+    if(!review||review.length===0){
+      rq.innerHTML='<div style="background:#F0FFF4;border:1px solid #86EFAC;border-radius:12px;padding:24px;text-align:center;color:#166534;font-size:14px;font-weight:500">✓ Nothing waiting for review — the agent is handling everything.</div>';
+    }else{
+      rq.innerHTML=review.map(item=>\`
+        <div id="review-\${item.id}" style="border:1px solid #FEE2E2;border-radius:12px;margin-bottom:12px;overflow:hidden;animation:fadeIn .2s ease">
+          <div style="padding:12px 16px;background:#FFF5F5;cursor:pointer" onclick="toggleReview('\${item.id}')">
+            <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:8px">
+              <div style="flex:1;min-width:0"><div style="font-size:13px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">\${item.email?.subject||''}</div><div style="font-size:11px;color:#6B7280;margin-top:2px">From: \${item.email?.from||''}</div></div>
+              <div style="display:flex;gap:6px;flex-shrink:0">
+                <button onclick="event.stopPropagation();discardReview('\${item.id}')" class="btn btn-red" style="padding:5px 10px;font-size:11px">Discard</button>
+                <span style="font-size:12px;color:#6B7280;padding:5px 4px">▼</span>
+              </div>
+            </div>
+            <!-- AI Analysis Summary -->
+            \${item.understanding?\`
+            <div style="display:flex;gap:6px;flex-wrap:wrap">
+              <span class="step-badge">Step 1: \${item.understanding.intent||''}</span>
+              <span style="font-size:10px;font-weight:600;padding:2px 8px;border-radius:20px;background:#FFF7ED;color:#92400E">Urgency: \${item.understanding.urgency||''}</span>
+              <span style="font-size:10px;font-weight:600;padding:2px 8px;border-radius:20px;background:\${(item.classification?.confidence||0)>=88?'#F0FFF4':'#FFF0F0'};color:\${(item.classification?.confidence||0)>=88?'#059669':'#C0392B'}">\${item.classification?.confidence||0}% confidence</span>
+            </div>
+            <div style="font-size:11px;color:#B91C1C;margin-top:6px;font-weight:500">🛑 Held: \${item.holdReason||item.classification?.reason||''}</div>
+            \`:''}
+          </div>
+          <div id="review-body-\${item.id}" style="display:none;padding:14px 16px;border-top:1px solid #FEE2E2">
+            <div style="font-size:12px;color:#374151;background:#F8FAFC;border:1px solid #E5E7EB;border-radius:8px;padding:12px;margin-bottom:12px;line-height:1.65">\${item.email?.body||''}</div>
+            \${item.understanding?.risks?.length>0?\`<div style="font-size:11px;color:#92400E;background:#FFF7ED;padding:8px 10px;border-radius:6px;margin-bottom:10px">⚠️ Risks flagged: \${item.understanding.risks.join(', ')}</div>\`:''}
+            <div style="font-size:10px;font-weight:700;color:#6B7280;margin-bottom:6px;letter-spacing:.5px">🤖 AI DRAFT — edit before sending</div>
+            <textarea id="review-draft-\${item.id}" style="width:100%;min-height:150px;padding:10px 12px;border:1px solid #D1D5DB;border-radius:8px;font-size:13px;line-height:1.7;resize:vertical;margin-bottom:10px">\${item.draftReply||''}</textarea>
+            <button class="btn btn-green" onclick="approveReview('\${item.id}')">✓ Approve & Send</button>
+          </div>
+        </div>
+      \`).join('');
     }
   }
 
   // Archive
-  var al = el('archive-list');
-  if(al){
-    if(!D.archive||D.archive.length===0){
-      al.innerHTML='<div style="font-size:13px;color:var(--stone-lt);font-style:italic">No old emails archived yet.</div>';
-    } else {
-      al.innerHTML = D.archive.slice(0,50).map(function(item){
-        return '<div class="card" style="opacity:'+(item.followedUp?.5:1)+';border-color:'+(item.followedUp?'rgba(92,122,95,.2)':'var(--border)')+'"><div style="display:flex;align-items:flex-start;justify-content:space-between;gap:12px"><div style="flex:1;min-width:0"><div style="font-size:13.5px;font-weight:500;margin-bottom:3px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+esc(item.email&&item.email.subject||'')+'</div><div style="font-size:12px;color:var(--muted);margin-bottom:8px">From: '+esc(item.email&&item.email.from||'')+'</div><span class="tag" style="background:'+(item.followedUp?'var(--sage-pale)':'var(--amber-lt)')+';color:'+(item.followedUp?'var(--sage-deep)':'var(--amber)')+'">'+( item.followedUp?'&#x2713; Followed up':'&#x26A0; Needs follow-up')+'</span></div>'+(item.followedUp?'':'<button onclick="markFollowedUp(\''+item.id+'\')" class="btn btn-amber btn-sm" style="flex-shrink:0">Mark Done</button>')+'</div><div style="margin-top:10px;font-size:13px;color:var(--muted);background:var(--cream);border:1px solid var(--border-lt);border-radius:var(--r-sm);padding:10px;line-height:1.65">'+esc((item.email&&item.email.body||'').slice(0,250))+'...</div></div>';
-      }).join('');
+  const archiveEl=document.getElementById('archive-items');
+  if(archiveEl){
+    if(!archive||archive.length===0){
+      archiveEl.innerHTML='<div style="font-size:13px;color:#9CA3AF">No old emails archived yet.</div>';
+    }else{
+      archiveEl.innerHTML=archive.slice(0,50).map(item=>\`
+        <div style="background:#fff;border:1px solid \${item.followedUp?'#D1FAE5':'#FDE68A'};border-radius:12px;padding:14px 16px;margin-bottom:10px;opacity:\${item.followedUp?.6:1};animation:fadeIn .2s ease">
+          <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:12px">
+            <div style="flex:1;min-width:0">
+              <div style="font-size:13px;font-weight:600;margin-bottom:3px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">\${item.email?.subject||''}</div>
+              <div style="font-size:12px;color:#6B7280;margin-bottom:6px">From: \${item.email?.from||''}</div>
+              <div style="font-size:11px;color:\${item.followedUp?'#059669':'#D97706'};font-weight:600">\${item.followedUp?'✓ Followed up':'⚠️ Needs follow-up — this sender is waiting'}</div>
+            </div>
+            <div style="display:flex;gap:6px;flex-shrink:0">
+              \${!item.followedUp?
+                \`<button onclick="markFollowedUp('\${item.id}')" class="btn btn-amber" style="padding:6px 12px;font-size:11px">✓ Mark Done</button>\`
+                :'<span style="font-size:11px;color:#059669;font-weight:600;padding:6px 4px">Done ✓</span>'
+              }
+            </div>
+          </div>
+          <div style="margin-top:10px;font-size:13px;color:#374151;background:#F8FAFC;border:1px solid #E5E7EB;border-radius:8px;padding:10px;line-height:1.65">\${item.email?.body||''}</div>
+        </div>
+      \`).join('');
     }
   }
 
-  // Notifications
-  var nl = el('notif-list');
+  // Notifications panel
+  const nl=document.getElementById('notif-list');
   if(nl){
-    if(!D.notifs||D.notifs.length===0){
-      nl.innerHTML='<div style="padding:24px;text-align:center;color:var(--stone-lt);font-size:13px">No notifications</div>';
-    } else {
-      nl.innerHTML = D.notifs.slice(0,20).map(function(n){
-        return '<div style="padding:12px 16px;border-bottom:1px solid var(--border-lt);background:'+(n.read?'var(--white)':'var(--sage-pale)')+';cursor:pointer" onclick="handleNotif(\''+n.id+'\',\''+n.type+'\')">'
-          +'<div style="display:flex;gap:10px"><span style="font-size:15px;flex-shrink:0">&#x1F4C1;</span><div style="flex:1;min-width:0">'
-          +'<div style="font-size:12.5px;font-weight:'+(n.read?400:600)+';color:var(--charcoal);margin-bottom:2px">'+esc(n.title)+'</div>'
-          +'<div style="font-size:11.5px;color:var(--muted);line-height:1.5">'+esc(n.message)+'</div>'
-          +'<div style="font-size:10.5px;color:var(--stone-lt);margin-top:3px">'+new Date(n.createdAt).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})+'</div>'
-          +'</div>'+(n.read?'':'<span class="dot" style="background:var(--amber);margin-top:4px;flex-shrink:0"></span>')+'</div></div>';
-      }).join('');
+    if(!notifications||notifications.length===0){
+      nl.innerHTML='<div style="padding:20px;text-align:center;color:#9CA3AF;font-size:13px">No notifications</div>';
+    }else{
+      nl.innerHTML=notifications.slice(0,20).map(n=>\`
+        <div style="padding:12px 16px;border-bottom:1px solid #F3F4F6;background:\${n.read?'#fff':'#FFFBEB'};cursor:pointer" onclick="handleNotifClick('\${n.id}','\${n.type}')">
+          <div style="display:flex;gap:8px;align-items:flex-start">
+            <span style="font-size:16px;flex-shrink:0">📁</span>
+            <div style="flex:1;min-width:0">
+              <div style="font-size:12px;font-weight:\${n.read?400:600};color:#111827;margin-bottom:2px">\${n.title}</div>
+              <div style="font-size:11px;color:#6B7280;line-height:1.5">\${n.message}</div>
+              <div style="font-size:10px;color:#9CA3AF;margin-top:3px">\${new Date(n.createdAt).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})}</div>
+            </div>
+            \${!n.read?'<span style="width:6px;height:6px;border-radius:50%;background:#F59E0B;flex-shrink:0;margin-top:4px"></span>':''}
+          </div>
+        </div>
+      \`).join('');
     }
   }
 
   // Voice
-  if(D.voice){
-    var gv = el('guidelines-view'); if(gv) gv.textContent = D.voice.guidelines||'';
-    var vs = el('voice-samples');
+  if(voice){
+    const gv=document.getElementById('guidelines-view');
+    if(gv)gv.textContent=voice.guidelines||'';
+    const vs=document.getElementById('voice-samples');
     if(vs){
-      vs.innerHTML = (D.voice.samples||[]).length===0
-        ? '<div style="font-size:13px;color:var(--stone-lt);margin-bottom:14px;font-style:italic">No samples yet.</div>'
-        : (D.voice.samples||[]).map(function(s,i){
-            return '<div style="background:var(--sage-pale);border:1px solid rgba(92,122,95,.15);border-radius:var(--r-sm);padding:12px;margin-bottom:8px;display:flex;gap:10px"><div style="flex:1;font-size:13px;color:var(--muted);line-height:1.65">'+esc(s)+'</div><button onclick="removeSample('+i+')" style="background:none;border:none;color:var(--stone-lt);cursor:pointer;font-size:16px;flex-shrink:0;padding:0">&#x00D7;</button></div>';
-          }).join('');
+      vs.innerHTML=(voice.samples||[]).length===0
+        ?'<div style="font-size:13px;color:#9CA3AF;margin-bottom:14px">No samples yet.</div>'
+        :(voice.samples||[]).map((s,i)=>\`<div style="background:#F8FAFC;border:1px solid #E5E7EB;border-radius:8px;padding:12px;margin-bottom:8px;display:flex;gap:10px"><div style="flex:1;font-size:13px;color:#374151;line-height:1.6">\${s}</div><button onclick="removeSample(\${i})" style="background:none;border:none;color:#EF4444;cursor:pointer;font-size:16px;flex-shrink:0">×</button></div>\`).join('');
     }
   }
 
   // Sent log
-  var sl = el('sent-list');
-  if(sl&&D.sent&&D.sent.length>0){
-    sl.innerHTML = D.sent.slice(0,50).map(function(item){
-      var conf = item.confidence||0;
-      return '<div class="card" style="padding:0;overflow:hidden;cursor:pointer" onclick="toggleEl(\'sb-'+item.id+'\')">'
-        +'<div style="padding:12px 16px;display:flex;align-items:center;justify-content:space-between;gap:12px">'
-        +'<div style="flex:1;min-width:0"><div style="font-size:13.5px;font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+esc(item.email&&item.email.subject||'')+'</div>'
-        +'<div style="font-size:12px;color:var(--muted);margin-top:3px;display:flex;gap:8px;align-items:center">To: '+esc(item.email&&item.email.from||'')
-        +' <span class="tag" style="background:'+(conf>=80?'var(--sage-pale)':'var(--amber-lt)')+';color:'+(conf>=80?'var(--sage-deep)':'var(--amber)')+'">'+conf+'%</span>'
-        +(item.manualApproval?'<span class="tag" style="background:var(--blue-lt);color:var(--blue)">Staff approved</span>':'')+'</div></div>'
-        +'<div style="font-size:11px;color:var(--stone-lt);text-align:right;flex-shrink:0"><div>'+new Date(item.sentAt).toLocaleDateString()+'</div><div>'+new Date(item.sentAt).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})+'</div></div></div>'
-        +'<div id="sb-'+item.id+'" style="display:none;padding:0 16px 16px;border-top:1px solid var(--border-lt)">'
-        +'<div style="font-size:10.5px;font-weight:700;color:var(--stone-lt);margin:12px 0 6px;letter-spacing:.06em;text-transform:uppercase">Sent Reply</div>'
-        +'<div style="background:var(--cream);border:1px solid var(--border-lt);border-radius:var(--r-sm);padding:12px;font-size:13px;color:var(--muted);line-height:1.75;white-space:pre-wrap">'+esc(item.replyBody||'')+'</div>'
-        +'</div></div>';
-    }).join('');
+  const sentEl=document.getElementById('sent-log-items');
+  if(sentEl&&sent&&sent.length>0){
+    sentEl.innerHTML=sent.slice(0,50).map(item=>\`
+      <div style="background:#fff;border:1px solid #E5E7EB;border-radius:12px;margin-bottom:10px;overflow:hidden;cursor:pointer" onclick="toggleSent('\${item.id}')">
+        <div style="padding:12px 16px;display:flex;align-items:center;justify-content:space-between;gap:12px">
+          <div style="flex:1;min-width:0">
+            <div style="font-size:13px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">\${item.email?.subject||''}</div>
+            <div style="font-size:11px;color:#6B7280;margin-top:2px;display:flex;gap:8px;flex-wrap:wrap">
+              <span>To: \${item.email?.from||''}</span>
+              <span style="font-size:10px;font-weight:700;padding:2px 8px;border-radius:20px;background:\${(item.confidence||0)>=88?'#F0FFF4':'#FFFBEB'};color:\${(item.confidence||0)>=88?'#059669':'#D97706'}">\${item.confidence||0}% confidence</span>
+              \${item.manualApproval?'<span style="font-size:10px;font-weight:600;padding:2px 7px;border-radius:20px;background:#EFF6FF;color:#1D4ED8">Staff approved</span>':''}
+            </div>
+          </div>
+          <div style="font-size:11px;color:#9CA3AF;text-align:right;flex-shrink:0"><div>\${new Date(item.sentAt).toLocaleDateString()}</div><div>\${new Date(item.sentAt).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})}</div></div>
+        </div>
+        <div id="sent-body-\${item.id}" style="display:none;padding:0 16px 14px;border-top:1px solid #F3F4F6">
+          \${item.understanding?\`<div style="font-size:11px;color:#0284C7;background:#F0F9FF;padding:8px 10px;border-radius:6px;margin:10px 0 8px"><span class="step-badge" style="margin-right:6px">AI Analysis</span>Intent: \${item.understanding.intent||''} · \${item.understanding.sentiment||''} sentiment</div>\`:''}
+          <div style="font-size:10px;font-weight:700;color:#6B7280;margin-bottom:6px;letter-spacing:.5px">SENT REPLY</div>
+          <div style="background:#F8FAFC;border:1px solid #E5E7EB;border-radius:8px;padding:12px;font-size:13px;color:#374151;line-height:1.7;white-space:pre-wrap">\${item.replyBody||''}</div>
+        </div>
+      </div>
+    \`).join('');
   }
-
-  if(currentTab==='crm') renderCRM();
 }
 
-function renderCRM(){
-  var stats = D.crmStats||{};
-  var se = el('crm-stats');
-  if(se){
-    se.innerHTML = [
-      {l:'Total',v:stats.total||0,bg:'var(--white)',c:'var(--charcoal)'},
-      {l:'Active',v:stats.active||0,bg:'var(--sage-pale)',c:'var(--sage-deep)'},
-      {l:'Need Follow-Up',v:stats.silent||0,bg:'var(--amber-lt)',c:'var(--amber)'},
-      {l:'Follow-Up Sent',v:stats.followUp||0,bg:'var(--blue-lt)',c:'var(--blue)'},
-      {l:'Lost',v:stats.lost||0,bg:'var(--border-lt)',c:'var(--stone)'},
-    ].map(function(s){
-      return '<div style="background:'+s.bg+';border:1px solid var(--border);border-radius:var(--r);padding:16px;text-align:center;box-shadow:var(--shadow)">'
-        +'<div style="font-family:\'Cormorant Garamond\',serif;font-size:28px;font-weight:500;color:'+s.c+';line-height:1">'+s.v+'</div>'
-        +'<div style="font-size:11px;color:var(--muted);margin-top:5px;font-weight:500">'+s.l+'</div></div>';
-    }).join('');
-  }
-  var cl2 = el('crm-list');
-  if(!cl2) return;
-  var crm = D.crm||[];
-  if(crm.length===0){ cl2.innerHTML='<div style="font-size:13px;color:var(--stone-lt);font-style:italic;padding:20px 0">No contacts yet — they appear automatically as emails come in.</div>'; return; }
-  var now = Date.now();
-  cl2.innerHTML = '<div style="background:var(--white);border:1px solid var(--border);border-radius:var(--r);overflow:hidden;box-shadow:var(--shadow)">'
-    +'<div style="display:grid;grid-template-columns:2fr 2fr 1fr 1fr 1.2fr 1fr;border-bottom:1px solid var(--border);background:var(--cream)">'
-    +['Contact','Last Topic','Last Seen','Touches','Status','Action'].map(function(h){ return '<div style="padding:10px 12px;font-size:10.5px;font-weight:700;color:var(--stone);letter-spacing:.06em;text-transform:uppercase">'+h+'</div>'; }).join('')
-    +'</div>'
-    + crm.slice(0,100).map(function(c,i){
-        var st = CRM_LABELS[c.status]||CRM_LABELS.active;
-        var days = Math.round((now - new Date(c.lastSeen).getTime())/86400000);
-        var silent = days>=14 && c.status!=='lost' && c.status!=='opted_out';
-        var bg = silent ? '#FEFAF3' : (i%2===0?'var(--white)':'var(--cream)');
-        return '<div style="display:contents">'
-          +'<div style="padding:10px 12px;border-bottom:1px solid var(--border-lt);background:'+bg+'"><div style="font-size:13px;font-weight:500;color:var(--charcoal)">'+esc(c.name)+'</div><div style="font-size:11px;color:var(--stone-lt);margin-top:1px">'+esc(c.email)+'</div></div>'
-          +'<div style="padding:10px 12px;border-bottom:1px solid var(--border-lt);font-size:12.5px;color:var(--muted);background:'+bg+';overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+esc(c.lastSubject||'—')+'</div>'
-          +'<div style="padding:10px 12px;border-bottom:1px solid var(--border-lt);font-size:12.5px;color:'+(silent?'var(--amber)':'var(--muted)')+';font-weight:'+(silent?600:400)+';background:'+bg+'">'+(silent?'&#x26A0; ':'')+days+'d</div>'
-          +'<div style="padding:10px 12px;border-bottom:1px solid var(--border-lt);font-size:12.5px;color:var(--muted);background:'+bg+';text-align:center">'+(c.touchCount||1)+'</div>'
-          +'<div style="padding:10px 12px;border-bottom:1px solid var(--border-lt);background:'+bg+'"><span class="tag" style="background:'+st.bg+';color:'+st.c+'">'+st.l+'</span></div>'
-          +'<div style="padding:8px 10px;border-bottom:1px solid var(--border-lt);background:'+bg+'"><select onchange="updateCRM(\''+c.id+'\',this.value)" style="font-size:11.5px;padding:4px 6px;border:1px solid var(--border);border-radius:var(--r-sm);cursor:pointer;background:var(--white);width:100%"><option value="">Change...</option><option value="active">Active</option><option value="booked">Booked</option><option value="lost">Lost</option><option value="opted_out">Opted Out</option></select></div>'
-          +'</div>';
-      }).join('')
-    +'</div>';
+// Actions
+async function cancelSend(id){try{await apiFetch('/api/queue/'+id+'/cancel',{method:'POST'});showToast('Send cancelled');await refreshData();}catch(e){showErr(e.message);}}
+function toggleReview(id){const b=document.getElementById('review-body-'+id);if(b)b.style.display=b.style.display==='none'?'block':'none';}
+async function approveReview(id){const draft=document.getElementById('review-draft-'+id)?.value;try{await apiFetch('/api/review/'+id+'/approve',{method:'POST',body:JSON.stringify({reply:draft})});showToast('✓ Reply sent');await refreshData();}catch(e){showErr(e.message);}}
+async function discardReview(id){try{await apiFetch('/api/review/'+id+'/discard',{method:'POST'});showToast('Discarded');await refreshData();}catch(e){showErr(e.message);}}
+function toggleSent(id){const b=document.getElementById('sent-body-'+id);if(b)b.style.display=b.style.display==='none'?'block':'none';}
+async function markFollowedUp(id){try{await apiFetch('/api/archive/'+id+'/followup',{method:'POST'});showToast('✓ Marked as followed up');await refreshData();}catch(e){showErr(e.message);}}
+
+function toggleNotifPanel(){
+  notifPanelOpen=!notifPanelOpen;
+  document.getElementById('notif-panel').style.display=notifPanelOpen?'block':'none';
+}
+async function markAllRead(){try{await apiFetch('/api/notifications/read-all',{method:'POST'});await refreshData();}catch(e){}}
+async function handleNotifClick(id,type){
+  await apiFetch('/api/notifications/'+id+'/read',{method:'POST'}).catch(()=>{});
+  if(type==='old_email')showTab('Archive');
+  toggleNotifPanel();
+  await refreshData();
 }
 
-// ── ACTIONS
-function toggleEl(id){ var e=el(id); if(e) e.style.display=e.style.display==='none'?'block':'none'; }
-function cancelSend(id){ apiFetch('/api/queue/'+id+'/cancel',{method:'POST'}).then(function(){showToast('Send cancelled');refreshData();}).catch(function(e){showErr(e.message);}); }
-function approveReview(id){ var draft=el('rd-'+id); apiFetch('/api/review/'+id+'/approve',{method:'POST',body:JSON.stringify({reply:draft?draft.value:''})}).then(function(){showToast('Reply sent');refreshData();}).catch(function(e){showErr(e.message);}); }
-function discardReview(id){ apiFetch('/api/review/'+id+'/discard',{method:'POST'}).then(function(){showToast('Discarded');refreshData();}).catch(function(e){showErr(e.message);}); }
-function markFollowedUp(id){ apiFetch('/api/archive/'+id+'/followup',{method:'POST'}).then(function(){showToast('Marked as followed up');refreshData();}).catch(function(e){showErr(e.message);}); }
-function toggleNotif(){ notifOpen=!notifOpen; el('notif-panel').style.display=notifOpen?'block':'none'; }
-function markAllRead(){ apiFetch('/api/notifications/read-all',{method:'POST'}).then(refreshData).catch(function(){}); }
-function handleNotif(id,type){ apiFetch('/api/notifications/'+id+'/read',{method:'POST'}).catch(function(){}); if(type==='old_email')showTab('archive'); toggleNotif(); refreshData(); }
+// Voice
+function toggleEditGuidelines(){
+  editingGuidelines=!editingGuidelines;
+  document.getElementById('guidelines-view').style.display=editingGuidelines?'none':'block';
+  document.getElementById('guidelines-edit').style.display=editingGuidelines?'block':'none';
+  if(editingGuidelines){const ta=document.getElementById('guidelines-textarea');if(ta)ta.value=serverData.voice?.guidelines||'';}
+}
+async function saveGuidelines(){const g=document.getElementById('guidelines-textarea').value;try{await apiFetch('/api/voice/guidelines',{method:'POST',body:JSON.stringify({guidelines:g})});toggleEditGuidelines();showToast('✓ Voice guidelines saved');await refreshData();}catch(e){showErr(e.message);}}
+async function addSample(){const s=document.getElementById('new-sample-input').value.trim();if(!s)return;try{await apiFetch('/api/voice/sample',{method:'POST',body:JSON.stringify({sample:s})});document.getElementById('new-sample-input').value='';showToast('✓ Sample added');await refreshData();}catch(e){showErr(e.message);}}
+async function removeSample(i){try{await apiFetch('/api/voice/sample/'+i,{method:'DELETE'});showToast('Sample removed');await refreshData();}catch(e){showErr(e.message);}}
 
-// ── VOICE
-function toggleGuidelines(){ editingGuidelines=!editingGuidelines; el('guidelines-view').style.display=editingGuidelines?'none':'block'; el('guidelines-edit').style.display=editingGuidelines?'block':'none'; if(editingGuidelines){var ta=el('guidelines-ta');if(ta&&D.voice)ta.value=D.voice.guidelines||'';} }
-function saveGuidelines(){ var g=el('guidelines-ta').value; apiFetch('/api/voice/guidelines',{method:'POST',body:JSON.stringify({guidelines:g})}).then(function(){toggleGuidelines();showToast('Guidelines saved');refreshData();}).catch(function(e){showErr(e.message);}); }
-function addSample(){ var s=el('new-sample').value.trim(); if(!s)return; apiFetch('/api/voice/sample',{method:'POST',body:JSON.stringify({sample:s})}).then(function(){el('new-sample').value='';showToast('Sample added');refreshData();}).catch(function(e){showErr(e.message);}); }
-function removeSample(i){ apiFetch('/api/voice/sample/'+i,{method:'DELETE'}).then(function(){showToast('Removed');refreshData();}).catch(function(e){showErr(e.message);}); }
-
-// ── CRM
-function addCRM(){ var email=el('crm-email').value.trim(),name=el('crm-name').value.trim(),notes=el('crm-notes').value.trim(); if(!email){showErr('Email required');return;} apiFetch('/api/crm',{method:'POST',body:JSON.stringify({email:email,name:name,notes:notes})}).then(function(){el('crm-email').value='';el('crm-name').value='';el('crm-notes').value='';showToast('Contact added');refreshData();}).catch(function(e){showErr(e.message);}); }
-function updateCRM(id,status){ if(!status)return; apiFetch('/api/crm/'+id,{method:'PATCH',body:JSON.stringify({status:status})}).then(function(){showToast('Status updated');refreshData();}).catch(function(e){showErr(e.message);}); }
-
-// ── INBOX
+// Inbox
 function renderEmailList(){
-  var list=el('email-list'); if(!list) return;
-  list.innerHTML = DEMO.map(function(e){
-    var tag=TAGS[e.tag]||{bg:'#eee',c:'#555',l:e.tag};
-    return '<div class="email-row '+(e.status==='unread'?'':'')+(selectedEmail===e.id?' selected':'')+'" onclick="selectEmail('+e.id+')" style="'+(e.status==='unread'?'background:#FAFFF9;':'')+(selectedEmail===e.id?'background:var(--sage-pale);border-left-color:var(--sage);':'')+'">'
-      +'<div style="display:flex;justify-content:space-between;margin-bottom:3px;gap:6px">'
-      +'<span style="font-size:13px;font-weight:'+(e.status==='unread'?600:400)+';color:var(--charcoal);display:flex;align-items:center;gap:6px;overflow:hidden;flex:1">'
-      +(e.status==='unread'?'<span class="dot" style="background:var(--sage);flex-shrink:0"></span>':'')
-      +(e.status==='replied'?'<span style="font-size:10px;color:var(--sage);font-weight:600;flex-shrink:0">&#x2713;</span>':'')
-      +'<span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+esc(e.name)+'</span></span>'
-      +'<span style="font-size:10.5px;color:var(--stone-lt);flex-shrink:0">'+esc(e.time)+'</span></div>'
-      +'<div style="font-size:12px;font-weight:500;color:var(--muted);margin-bottom:5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+esc(e.subject)+'</div>'
-      +'<span class="tag" style="background:'+tag.bg+';color:'+tag.c+'">'+tag.l+'</span>'
-      +'</div>';
+  const list=document.getElementById('email-list');
+  if(!list)return;
+  list.innerHTML=DEMO_EMAILS.map(e=>{
+    const tag=TAGS[e.tag];
+    return \`<div style="padding:11px 14px;cursor:pointer;border-bottom:1px solid #F9FAFB;background:\${selectedEmailId===e.id?'#EFF6FF':e.status==='unread'?'#FAFFFE':'#fff'};border-left:3px solid \${selectedEmailId===e.id?'#0EA5E9':'transparent'}" onclick="selectEmail(\${e.id})">
+      <div style="display:flex;justify-content:space-between;margin-bottom:2px">
+        <span style="font-size:13px;font-weight:\${e.status==='unread'?700:500};color:#111827;display:flex;align-items:center;gap:5px;overflow:hidden;flex:1">
+          \${e.status==='unread'?'<span style="width:6px;height:6px;border-radius:50%;background:#0EA5E9;flex-shrink:0;display:inline-block"></span>':''}
+          \${e.status==='replied'?'<span style="font-size:10px;color:#059669;font-weight:600;flex-shrink:0">✓</span>':''}
+          <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">\${e.name}</span>
+        </span>
+        <span style="font-size:11px;color:#9CA3AF;flex-shrink:0;margin-left:4px">\${e.time}</span>
+      </div>
+      <div style="font-size:12px;font-weight:500;color:#334155;margin-bottom:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">\${e.subject}</div>
+      <span style="font-size:10px;font-weight:600;padding:2px 8px;border-radius:20px;background:\${tag.bg};color:\${tag.color}">\${tag.label}</span>
+    </div>\`;
   }).join('');
 }
 
-function selectEmail(id){
-  selectedEmail=id;
-  var email=DEMO.find(function(e){return e.id===id;});
+async function selectEmail(id){
+  selectedEmailId=id;
+  const email=DEMO_EMAILS.find(e=>e.id===id);
   if(!email)return;
-  if(email.status==='unread') email.status='read';
+  email.status=email.status==='unread'?'read':email.status;
   renderEmailList();
-  var det=el('email-detail'); if(!det)return;
-  var tag=TAGS[email.tag]||{bg:'#eee',c:'#555',l:email.tag};
-  det.style.alignItems='flex-start';
-  det.innerHTML='<div style="max-width:640px;width:100%;animation:fadeUp .2s ease">'
-    +'<div style="display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:6px">'
-    +'<div style="font-family:\'Cormorant Garamond\',serif;font-size:22px;font-weight:500;line-height:1.3;color:var(--charcoal)">'+esc(email.subject)+'</div>'
-    +'<span class="tag" style="background:'+tag.bg+';color:'+tag.c+';flex-shrink:0;font-size:11px;padding:3px 9px">'+tag.l+'</span></div>'
-    +'<div style="font-size:12px;color:var(--muted);margin-bottom:16px">From: <strong>'+esc(email.name)+'</strong> &middot; '+esc(email.time)+'</div>'
-    +'<div style="background:var(--white);border:1px solid var(--border);border-radius:var(--r);padding:18px;margin-bottom:16px;font-size:13.5px;line-height:1.8;color:var(--muted);box-shadow:var(--shadow)">'+esc(email.body)+'</div>'
-    +'<div id="sum-area"><div style="display:flex;align-items:center;gap:8px;color:var(--stone-lt);font-size:13px;padding:6px 0"><span class="spinner"></span>Analysing...</div></div>'
-    +(email.status==='replied'
-      ?'<div style="padding:10px 14px;background:var(--sage-pale);border:1px solid rgba(92,122,95,.2);border-radius:var(--r-sm);font-size:13px;color:var(--sage-deep);font-weight:500">&#x2713; Reply sent via Gmail</div>'
-      :'<div id="reply-sec"><button class="btn btn-primary" id="draft-btn" onclick="draftReply('+id+')">&#x2728; Draft Reply</button>'
-      +'<div id="reply-area" style="display:none;margin-top:16px">'
-      +'<div style="font-size:10.5px;font-weight:700;color:var(--stone-lt);margin-bottom:8px;letter-spacing:.06em;text-transform:uppercase">Drafted Reply — edit before sending</div>'
-      +'<textarea id="reply-txt" style="width:100%;min-height:180px;padding:14px;border:1px solid var(--border);border-radius:var(--r);font-size:13.5px;line-height:1.8;resize:vertical"></textarea>'
-      +'<div style="display:flex;gap:8px;margin-top:11px"><button class="btn btn-success" onclick="sendReply('+id+')">Send via Gmail</button><button class="btn btn-ghost" onclick="discardReply()">Discard</button></div>'
-      +'</div></div>'
-    )+'</div>';
+  const detail=document.getElementById('email-detail');
+  if(!detail)return;
+  const tag=TAGS[email.tag];
+  detail.style.display='block';
+  detail.style.alignItems='flex-start';
+  detail.innerHTML=\`<div style="max-width:640px;animation:fadeIn .2s ease;width:100%">
+    <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:6px">
+      <div style="font-family:'DM Serif Display',serif;font-size:20px;line-height:1.3">\${email.subject}</div>
+      <span style="font-size:11px;font-weight:600;padding:3px 9px;border-radius:20px;flex-shrink:0;background:\${tag.bg};color:\${tag.color}">\${tag.label}</span>
+    </div>
+    <div style="font-size:12px;color:#64748B;margin-bottom:14px">From: <strong>\${email.name}</strong> · \${email.time}</div>
+    <div style="background:#fff;border:1px solid #E2E8F0;border-radius:10px;padding:18px;margin-bottom:14px;font-size:14px;line-height:1.75;color:#334155">\${email.body}</div>
+    <div id="summary-area"><div style="display:flex;align-items:center;gap:8px;color:#6B7280;font-size:13px;padding:6px 0"><div class="spinner"></div>Running 2-step analysis…</div></div>
+    \${email.status==='replied'
+      ?'<div style="padding:10px 14px;background:#F0FFF4;border:1px solid #86EFAC;border-radius:8px;font-size:13px;color:#166534;font-weight:500">✓ Reply sent</div>'
+      :\`<div id="reply-section">
+        <button class="btn btn-blue" id="draft-btn" onclick="draftReply(\${email.id})">✨ Draft Reply</button>
+        <div id="reply-area" style="display:none;margin-top:14px;animation:fadeIn .25s ease">
+          <div style="font-size:11px;font-weight:700;color:#64748B;margin-bottom:8px;letter-spacing:.5px">DRAFTED REPLY — edit before sending</div>
+          <textarea id="reply-text" style="width:100%;min-height:180px;padding:14px;border:1px solid #CBD5E1;border-radius:10px;font-size:13.5px;line-height:1.75;resize:vertical;color:#1E293B"></textarea>
+          <div style="display:flex;gap:8px;margin-top:10px">
+            <button class="btn btn-green" onclick="sendReply(\${email.id})">📤 Send via Gmail</button>
+            <button class="btn btn-gray" onclick="discardReply()">Discard</button>
+          </div>
+        </div>
+      </div>\`
+    }
+  </div>\`;
 
-  callClaude('2-step analysis: (1) What does this person want and what is their mood? (2) What should Expert Physio do? Max 2 sentences total.\n\nFrom: '+email.name+'\nSubject: '+email.subject+'\nBody: '+email.body)
-    .then(function(s){
-      var sa=el('sum-area');
-      if(sa) sa.innerHTML='<div style="background:var(--sage-pale);border:1px solid rgba(92,122,95,.2);border-radius:var(--r-sm);padding:12px 14px;margin-bottom:16px"><div style="display:flex;gap:6px;margin-bottom:5px"><span class="step-badge">AI Analysis</span></div><div style="font-size:13px;color:var(--sage-deep);line-height:1.65">'+esc(s)+'</div></div>';
-    }).catch(function(){ var sa=el('sum-area'); if(sa) sa.innerHTML=''; });
+  try{
+    const summary=await callClaude('Run a 2-step analysis on this email.\\n\\nStep 1 — Understand: What does this person actually want? What is their sentiment?\\nStep 2 — Recommend: What should the clinic do?\\n\\nBe concise, max 3 sentences total.\\n\\nFrom: '+email.name+'\\nSubject: '+email.subject+'\\nBody: '+email.body);
+    const sa=document.getElementById('summary-area');
+    if(sa)sa.innerHTML=\`<div style="background:#F0F9FF;border:1px solid #BAE6FD;border-radius:10px;padding:13px 16px;margin-bottom:14px;animation:fadeIn .25s ease">
+      <div style="display:flex;gap:6px;margin-bottom:6px"><span class="step-badge">Step 1</span><span class="step-badge">Step 2</span><span style="font-size:10px;font-weight:700;color:#0284C7;padding:2px 8px;border-radius:20px;background:#E0F2FE">AI Analysis Complete</span></div>
+      <div style="font-size:13px;color:#1E40AF;line-height:1.65">\${summary}</div>
+    </div>\`;
+  }catch(e){const sa=document.getElementById('summary-area');if(sa)sa.innerHTML='';}
 }
 
-function draftReply(id){
-  var email=DEMO.find(function(e){return e.id===id;});
+async function draftReply(id){
+  const email=DEMO_EMAILS.find(e=>e.id===id);
   if(!email)return;
-  var btn=el('draft-btn'); if(btn){btn.disabled=true;btn.innerHTML='<span class="spinner"></span> Drafting...';}
-  callClaude('Write a professional reply for Expert Physio. No subject line. Start with greeting. End with Expert Physio Team.\n\nFrom: '+email.name+'\nSubject: '+email.subject+'\nBody: '+email.body)
-    .then(function(r){ var ra=el('reply-area'),rt=el('reply-txt'); if(ra&&rt){rt.value=r;ra.style.display='block';} var btn2=el('draft-btn');if(btn2)btn2.style.display='none'; })
-    .catch(function(e){ showErr('Draft failed: '+e.message); var btn2=el('draft-btn');if(btn2){btn2.disabled=false;btn2.innerHTML='&#x2728; Draft Reply';} });
+  const btn=document.getElementById('draft-btn');
+  if(btn){btn.disabled=true;btn.innerHTML='<div class="spinner"></div> Drafting…';}
+  try{
+    const reply=await callClaude('Write a professional reply for Expert Physio. No subject line. Start with greeting. End with Expert Physio Team.\\n\\nFrom: '+email.name+'\\nSubject: '+email.subject+'\\nBody: '+email.body);
+    const ra=document.getElementById('reply-area');const rt=document.getElementById('reply-text');
+    if(ra&&rt){rt.value=reply;ra.style.display='block';}
+    if(btn)btn.style.display='none';
+  }catch(e){showErr('Draft failed: '+e.message);if(btn){btn.disabled=false;btn.innerHTML='✨ Draft Reply';}}
 }
-function sendReply(id){ var email=DEMO.find(function(e){return e.id===id;}); if(email){email.status='replied';showToast('Reply sent to '+email.name);renderEmailList();} var rs=el('reply-sec'); if(rs) rs.innerHTML='<div style="padding:10px 14px;background:var(--sage-pale);border:1px solid rgba(92,122,95,.2);border-radius:var(--r-sm);font-size:13px;color:var(--sage-deep);font-weight:500">&#x2713; Reply sent via Gmail</div>'; }
-function discardReply(){ var ra=el('reply-area'),btn=el('draft-btn'); if(ra)ra.style.display='none'; if(btn){btn.style.display='inline-flex';btn.innerHTML='&#x2728; Draft Reply';btn.disabled=false;} }
 
-// ── COMPOSE
-function generateEmail(){
-  var text=el('compose-input').value.trim(); if(!text)return;
-  var btn=el('compose-btn'),sp=el('compose-spinner'),comp=el('composed-email');
-  btn.disabled=true; sp.style.display='flex'; comp.style.display='none';
-  callClaude('Compose an Expert Physio clinic email: "'+text+'"\n\nReturn ONLY valid JSON: {"to":"email","subject":"subject","body":"body ending with Expert Physio Team"}. No markdown backticks.')
-    .then(function(raw){
-      var clean=raw.trim(); var m=clean.match(/\{[\s\S]*\}/); if(m) clean=m[0]; clean=clean.trim();
-      var obj=JSON.parse(clean);
-      el('c-to').value=obj.to||''; el('c-subject').value=obj.subject||''; el('c-body').value=obj.body||'';
-      comp.style.display='block';
-    }).catch(function(e){ showErr('Compose failed: '+e.message); })
-    .finally(function(){ btn.disabled=false; sp.style.display='none'; });
+function sendReply(id){
+  const email=DEMO_EMAILS.find(e=>e.id===id);
+  if(email){email.status='replied';showToast('✓ Reply sent to '+email.name);renderEmailList();}
+  const rs=document.getElementById('reply-section');
+  if(rs)rs.innerHTML='<div style="padding:10px 14px;background:#F0FFF4;border:1px solid #86EFAC;border-radius:8px;font-size:13px;color:#166534;font-weight:500">✓ Reply sent via Gmail</div>';
 }
-function sendComposed(){ showToast('Email sent: "'+el('c-subject').value+'"'); discardComposed(); }
-function discardComposed(){ el('composed-email').style.display='none'; el('compose-input').value=''; }
+function discardReply(){const ra=document.getElementById('reply-area');const btn=document.getElementById('draft-btn');if(ra)ra.style.display='none';if(btn){btn.style.display='inline-flex';btn.innerHTML='✨ Draft Reply';}}
 
-// ── INIT
-document.addEventListener('click', function(e){
-  if(notifOpen && !el('notif-panel').contains(e.target) && !el('bell-btn').contains(e.target)){ notifOpen=false; el('notif-panel').style.display='none'; }
-});
+// Compose
+async function generateEmail(){
+  const text=document.getElementById('compose-input').value.trim();
+  if(!text)return;
+  const btn=document.getElementById('compose-btn');const spinner=document.getElementById('compose-spinner');const composed=document.getElementById('composed-email');
+  btn.disabled=true;spinner.style.display='flex';composed.style.display='none';
+  try{
+    const raw=await callClaude('Compose a clinic email for Expert Physio: "'+text+'"\\n\\nReturn ONLY valid JSON: {"to":"email","subject":"subject","body":"body ending with Expert Physio Team"}. No markdown.');
+    const clean=raw.replace(/^\`\`\`(?:json)?\\s*/i,'').replace(/\\s*\`\`\`\\s*$/,'').trim();
+    const obj=JSON.parse(clean);
+    document.getElementById('c-to').value=obj.to||'';
+    document.getElementById('c-subject').value=obj.subject||'';
+    document.getElementById('c-body').value=obj.body||'';
+    composed.style.display='block';
+  }catch(e){showErr('Compose failed: '+e.message);}
+  finally{btn.disabled=false;spinner.style.display='none';}
+}
+function sendComposed(){const s=document.getElementById('c-subject').value;const t=document.getElementById('c-to').value;showToast('✓ Email sent: "'+s+'"');discardComposed();}
+function discardComposed(){document.getElementById('composed-email').style.display='none';document.getElementById('compose-input').value='';}
+
+// Init
+document.addEventListener('click',e=>{if(notifPanelOpen&&!document.getElementById('notif-panel').contains(e.target)&&!document.getElementById('bell-btn').contains(e.target)){notifPanelOpen=false;document.getElementById('notif-panel').style.display='none';}});
 refreshData();
-setInterval(refreshData, 8000);
-showTab('autopilot');
+setInterval(refreshData,8000);
+showTab('Autopilot');
 </script>
 </body>
-</html>`;
+</html>`);
+});
 
-app.get("*", (req, res) => res.send(DASHBOARD_HTML));
-
-app.listen(parseInt(PORT), () => log("Expert Physio Agent v3 running on port " + PORT, "success"));
+app.listen(parseInt(PORT), () => log(`Expert Physio Agent v3 running on port ${PORT}`, "success"));
