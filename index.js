@@ -293,7 +293,7 @@ Write ONLY the email body, starting with the greeting.`,
 
 const SEND_DELAY_MS   = 5 * 60 * 1000;  // 5-min cancel window
 const OLD_EMAIL_DAYS  = 3;               // emails older than 3 days = "old"
-const CONFIDENCE_MIN  = 88;             // raised from 80 — tighter auto-send threshold
+const CONFIDENCE_MIN  = 80;             // auto-send threshold
 
 // ─── STATE ────────────────────────────────────────────────────────────────────
 let archiveEmails = [];   // old emails (3+ days) — notification bell, never auto-send
@@ -787,7 +787,7 @@ app.get("*", (req, res) => {
 
           <!-- Rules -->
           <div class="card">
-            <div style="font-size:14px;font-weight:700;margin-bottom:14px">⚡ Auto-Send Rules <span style="font-size:11px;color:#6B7280;font-weight:400">(confidence threshold: 88%)</span></div>
+            <div style="font-size:14px;font-weight:700;margin-bottom:14px">⚡ Auto-Send Rules <span style="font-size:11px;color:#6B7280;font-weight:400">(confidence threshold: 80%)</span></div>
             ${[
               ['📅','Cancellations','Auto-reply offering reschedule',true],
               ['🙋','New Patient Inquiries','Auto-reply with welcome + booking info',true],
