@@ -920,6 +920,9 @@ app.get("*", (req, res) => {
     @keyframes pulse{0%,100%{opacity:1}50%{opacity:.5}}
     @keyframes shimmer{0%{background-position:200% center}100%{background-position:-200% center}}
     @keyframes bellRing{0%,100%{transform:rotate(0)}15%{transform:rotate(-20deg)}30%{transform:rotate(20deg)}45%{transform:rotate(-15deg)}60%{transform:rotate(15deg)}75%{transform:rotate(-8deg)}}
+
+    @keyframes shimmer{0%{background-position:200% center}100%{background-position:-200% center}}
+    @keyframes bellRing{0%,100%{transform:rotate(0)}15%{transform:rotate(-20deg)}30%{transform:rotate(20deg)}45%{transform:rotate(-15deg)}60%{transform:rotate(15deg)}75%{transform:rotate(-8deg)}}
     @keyframes introFade{0%{opacity:0;transform:scale(1.02)}100%{opacity:1;transform:scale(1)}}
 
     /* Scrollbar */
@@ -988,9 +991,6 @@ app.get("*", (req, res) => {
     /* Step badge */
     .step-badge{font-size:10px;font-weight:600;padding:2px 8px;border-radius:20px;background:var(--blue-lt);color:var(--blue-soft);display:inline-block}
 
-    /* Intro overlay */
-    #intro{position:fixed;inset:0;z-index:1000;background:var(--cream);display:flex;flex-direction:column;animation:introFade .6s ease}
-    #intro.hidden{display:none}
 
     /* Shimmer loading */
     .shimmer{background:linear-gradient(90deg,var(--border-lt) 25%,var(--border) 50%,var(--border-lt) 75%);background-size:400% 100%;animation:shimmer 1.5s infinite;border-radius:4px}
@@ -998,67 +998,6 @@ app.get("*", (req, res) => {
 </head>
 <body>
 
-<!-- ── INTRO SCREEN ─────────────────────────────────────────────────────────── -->
-<div id="intro">
-  <div style="flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:40px;text-align:center">
-
-    <!-- Logo mark -->
-    <div style="position:relative;margin-bottom:32px">
-      <div style="width:88px;height:88px;border-radius:24px;background:linear-gradient(135deg,var(--sage-deep),var(--sage));display:flex;align-items:center;justify-content:center;box-shadow:var(--shadow-lg);animation:fadeUp .5s ease .1s both">
-        <svg width="44" height="44" viewBox="0 0 44 44" fill="none">
-          <path d="M22 8C22 8 12 14 12 22C12 30 22 36 22 36C22 36 32 30 32 22C32 14 22 8 22 8Z" stroke="white" stroke-width="2" fill="none" stroke-linecap="round"/>
-          <path d="M16 22H28M22 16V28" stroke="white" stroke-width="2.5" stroke-linecap="round"/>
-        </svg>
-      </div>
-      <div style="position:absolute;bottom:-4px;right:-4px;width:22px;height:22px;border-radius:50%;background:var(--amber);display:flex;align-items:center;justify-content:center;animation:fadeUp .5s ease .3s both;box-shadow:0 2px 8px rgba(196,145,58,.4)">
-        <svg width="11" height="11" viewBox="0 0 11 11" fill="white"><path d="M5.5 1L6.8 4H10L7.5 6.2L8.4 9.5L5.5 7.8L2.6 9.5L3.5 6.2L1 4H4.2L5.5 1Z" fill="white"/></svg>
-      </div>
-    </div>
-
-    <!-- Brand -->
-    <div style="animation:fadeUp .5s ease .2s both">
-      <div style="font-family:'Cormorant Garamond',serif;font-size:38px;font-weight:500;color:var(--charcoal);letter-spacing:-0.5px;line-height:1.1">Expert Physio</div>
-      <div style="font-size:13px;color:var(--sage);font-weight:600;letter-spacing:.12em;text-transform:uppercase;margin-top:4px">AI Agent — v3</div>
-    </div>
-
-    <!-- Tagline -->
-    <div style="margin-top:20px;max-width:420px;animation:fadeUp .5s ease .35s both">
-      <div style="font-family:'Cormorant Garamond',serif;font-size:20px;color:var(--text-muted);font-weight:300;font-style:italic;line-height:1.6">
-        "Automating every email, following up every lead, and protecting every patient relationship — so your team can focus on what they do best."
-      </div>
-    </div>
-
-    <!-- Feature pills -->
-    <div style="display:flex;gap:8px;flex-wrap:wrap;justify-content:center;margin-top:28px;animation:fadeUp .5s ease .45s both">
-      ${["2-Step AI Review","Gmail Autopilot","Patient CRM","Lead Follow-Up","Voice Profile","Sent Log"].map(f =>
-        "<span style='font-size:11.5px;font-weight:500;padding:5px 13px;border-radius:20px;background:var(--warm-white);border:1px solid var(--border);color:var(--text-muted);box-shadow:var(--shadow-sm)'>" + f + "</span>"
-      ).join("")}
-    </div>
-
-    <!-- Status -->
-    <div style="margin-top:32px;animation:fadeUp .5s ease .5s both">
-      <div style="display:inline-flex;align-items:center;gap:8px;padding:10px 20px;border-radius:30px;background:var(--warm-white);border:1px solid var(--border);box-shadow:var(--shadow-sm);font-size:13px">
-        <span class="status-dot" style="background:${connected?"#6B8C6E":"#C4604A"};${connected?"animation:pulse 2s infinite":""}"></span>
-        <span style="color:var(--text);font-weight:500">${connected ? "Gmail connected — Autopilot active" : "Gmail not connected"}</span>
-      </div>
-    </div>
-
-    <!-- Enter button -->
-    <button onclick="dismissIntro()" style="margin-top:28px;padding:14px 40px;background:var(--sage-deep);color:#fff;border:none;border-radius:var(--radius);cursor:pointer;font-family:'Outfit',sans-serif;font-size:14px;font-weight:500;letter-spacing:.03em;box-shadow:var(--shadow-md);transition:all .2s;animation:fadeUp .5s ease .6s both" onmouseover="this.style.transform='translateY(-2px)';this.style.boxShadow='0 8px 32px rgba(44,44,44,.18)'" onmouseout="this.style.transform='none';this.style.boxShadow='var(--shadow-md)'">
-      Open Dashboard →
-    </button>
-
-    ${!connected ? `
-    <a href="/auth/login" style="display:inline-block;margin-top:12px;font-size:12.5px;color:var(--sage);text-decoration:none;font-weight:500;animation:fadeUp .5s ease .7s both">
-      Connect Gmail first →
-    </a>` : ""}
-  </div>
-
-  <!-- Footer -->
-  <div style="padding:20px;text-align:center;border-top:1px solid var(--border-lt)">
-    <div style="font-size:11.5px;color:var(--stone-lt)">Built for Expert Physio · Burnaby, BC · Powered by Claude AI</div>
-  </div>
-</div>
 
 <!-- ── TOAST ────────────────────────────────────────────────────────────────── -->
 <div id="toast"><span id="toast-msg"></span><button onclick="hideToast()" style="background:none;border:none;color:rgba(255,255,255,.5);cursor:pointer;font-size:18px;line-height:1;padding:0">×</button></div>
@@ -1075,9 +1014,9 @@ app.get("*", (req, res) => {
 <!-- ── HEADER ───────────────────────────────────────────────────────────────── -->
 <div style="background:var(--warm-white);border-bottom:1px solid var(--border);height:60px;display:flex;align-items:center;justify-content:space-between;padding:0 24px;flex-shrink:0;box-shadow:var(--shadow-sm)">
   <div style="display:flex;align-items:center;gap:12px">
-    <button onclick="showIntro()" style="width:38px;height:38px;border-radius:10px;background:linear-gradient(135deg,var(--sage-deep),var(--sage));display:flex;align-items:center;justify-content:center;border:none;cursor:pointer;box-shadow:var(--shadow-sm);flex-shrink:0">
+    <div style="width:38px;height:38px;border-radius:10px;background:linear-gradient(135deg,var(--sage-deep),var(--sage));display:flex;align-items:center;justify-content:center;border:none;cursor:pointer;box-shadow:var(--shadow-sm);flex-shrink:0">
       <svg width="20" height="20" viewBox="0 0 44 44" fill="none"><path d="M22 8C22 8 12 14 12 22C12 30 22 36 22 36C22 36 32 30 32 22C32 14 22 8 22 8Z" stroke="white" stroke-width="2" fill="none" stroke-linecap="round"/><path d="M16 22H28M22 16V28" stroke="white" stroke-width="2.5" stroke-linecap="round"/></svg>
-    </button>
+    </div>
     <div>
       <div style="font-family:'Cormorant Garamond',serif;font-size:17px;font-weight:500;color:var(--charcoal);letter-spacing:-.2px;line-height:1.1">Expert Physio <span style="font-weight:300;font-style:italic">AI Agent</span></div>
       <div id="status-line" style="font-size:10.5px;font-weight:500;letter-spacing:.03em;display:flex;align-items:center;gap:5px;margin-top:1px">
@@ -1421,8 +1360,6 @@ function showToast(msg){const t=document.getElementById('toast');document.getEle
 function hideToast(){document.getElementById('toast').style.display='none';}
 function showErr(msg){const b=document.getElementById('err-banner');document.getElementById('err-msg').textContent=msg;b.style.display='flex';}
 function hideErr(){document.getElementById('err-banner').style.display='none';}
-function dismissIntro(){var el=document.getElementById('intro');if(el){el.style.display='none';}}
-function showIntro(){document.getElementById('intro').classList.remove('hidden');}
 
 // ── TABS ───────────────────────────────────────────────────────────────────────
 function showTab(name){
