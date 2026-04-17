@@ -1031,7 +1031,7 @@ app.get("*", (req, res) => {
     <!-- Feature pills -->
     <div style="display:flex;gap:8px;flex-wrap:wrap;justify-content:center;margin-top:28px;animation:fadeUp .5s ease .45s both">
       ${["2-Step AI Review","Gmail Autopilot","Patient CRM","Lead Follow-Up","Voice Profile","Sent Log"].map(f =>
-        `<span style="font-size:11.5px;font-weight:500;padding:5px 13px;border-radius:20px;background:var(--warm-white);border:1px solid var(--border);color:var(--text-muted);box-shadow:var(--shadow-sm)">${f}</span>`
+        "<span style='font-size:11.5px;font-weight:500;padding:5px 13px;border-radius:20px;background:var(--warm-white);border:1px solid var(--border);color:var(--text-muted);box-shadow:var(--shadow-sm)'>" + f + "</span>"
       ).join("")}
     </div>
 
@@ -1102,18 +1102,14 @@ app.get("*", (req, res) => {
   <!-- SIDEBAR -->
   <div style="width:212px;background:var(--warm-white);border-right:1px solid var(--border);display:flex;flex-direction:column;flex-shrink:0">
     <div style="padding:16px 0 8px;flex:1">
-      ${[
-        ["Autopilot","⚡","Autopilot"],
-        ["Queue","👁","Review Queue"],
-        ["Archive","📁","Old Emails"],
-        ["CRM","👥","Patients"],
-        ["Voice","🎙","Voice Profile"],
-        ["Inbox","📬","Demo Inbox"],
-        ["Compose","✏️","Compose"],
-        ["Sent","📊","Sent Log"],
-      ].map(([id,icon,label]) =>
-        `<button class="tab-btn" id="tab-${id}" onclick="showTab('${id}')"><span><span class="tab-icon">${icon}</span>${label}</span><span id="badge-${id}" class="badge" style="background:var(--sage)"></span></button>`
-      ).join("")}
+      <button class="tab-btn" id="tab-Autopilot" onclick="showTab('Autopilot')"><span><span class="tab-icon">⚡</span>Autopilot</span><span id="badge-Autopilot" class="badge" style="background:var(--sage)"></span></button>
+<button class="tab-btn" id="tab-Queue" onclick="showTab('Queue')"><span><span class="tab-icon">👁</span>Review Queue</span><span id="badge-Queue" class="badge" style="background:var(--sage)"></span></button>
+<button class="tab-btn" id="tab-Archive" onclick="showTab('Archive')"><span><span class="tab-icon">📁</span>Old Emails</span><span id="badge-Archive" class="badge" style="background:var(--sage)"></span></button>
+<button class="tab-btn" id="tab-CRM" onclick="showTab('CRM')"><span><span class="tab-icon">👥</span>Patients</span><span id="badge-CRM" class="badge" style="background:var(--sage)"></span></button>
+<button class="tab-btn" id="tab-Voice" onclick="showTab('Voice')"><span><span class="tab-icon">🎙</span>Voice Profile</span><span id="badge-Voice" class="badge" style="background:var(--sage)"></span></button>
+<button class="tab-btn" id="tab-Inbox" onclick="showTab('Inbox')"><span><span class="tab-icon">📬</span>Demo Inbox</span><span id="badge-Inbox" class="badge" style="background:var(--sage)"></span></button>
+<button class="tab-btn" id="tab-Compose" onclick="showTab('Compose')"><span><span class="tab-icon">✏️</span>Compose</span><span id="badge-Compose" class="badge" style="background:var(--sage)"></span></button>
+<button class="tab-btn" id="tab-Sent" onclick="showTab('Sent')"><span><span class="tab-icon">📊</span>Sent Log</span><span id="badge-Sent" class="badge" style="background:var(--sage)"></span></button>
     </div>
     <!-- Stats card -->
     <div style="margin:0 12px 14px;padding:14px;background:var(--sage-pale);border-radius:var(--radius-sm);border:1px solid rgba(107,140,110,.15)">
@@ -1164,26 +1160,79 @@ app.get("*", (req, res) => {
           <div class="card" style="margin-bottom:16px">
             <div style="font-family:'Cormorant Garamond',serif;font-size:19px;font-weight:500;margin-bottom:4px">Auto-Send Rules</div>
             <div style="font-size:11.5px;color:var(--stone-lt);margin-bottom:16px">Confidence threshold: 80% · Old emails (3+ days): archived, never auto-sent</div>
-            ${[
-              ["📅","Cancellations","Acknowledge + offer reschedule",true],
-              ["🙋","New Patient Inquiries","Welcome + booking information",true],
-              ["💳","Simple Billing Questions","Acknowledge + 1-2 day follow-up",true],
-              ["👨‍⚕️","Doctor Referrals","Confirm receipt + contact timeline",true],
-              ["🏥","ICBC Claims","Always held for staff review",false],
-              ["😤","Complaints / Anger","Always held — human touch required",false],
-              ["🩺","Clinical Questions","Held — therapist judgment needed",false],
-              ["❓","Confidence < 80%","Held — AI not certain enough",false],
-            ].map(([icon,label,action,auto]) => `
             <div class="rule-row">
               <div style="display:flex;align-items:center;gap:12px">
-                <span style="font-size:17px;width:24px;text-align:center">${icon}</span>
+                <span style="font-size:17px;width:24px;text-align:center">📅</span>
                 <div>
-                  <div style="font-size:13px;font-weight:500;color:var(--charcoal)">${label}</div>
-                  <div style="font-size:11.5px;color:var(--text-muted);margin-top:1px">${action}</div>
+                  <div style="font-size:13px;font-weight:500;color:var(--charcoal)">Cancellations</div>
+                  <div style="font-size:11.5px;color:var(--text-muted);margin-top:1px">Acknowledge + offer reschedule</div>
                 </div>
               </div>
-              <span class="tag" style="background:${auto?"var(--sage-pale)":"var(--red-lt)"};color:${auto?"var(--sage-deep)":"var(--red-soft)"};flex-shrink:0">${auto?"✓ Auto":"👁 Review"}</span>
-            </div>`).join("")}
+              <span class="tag" style="background:var(--sage-pale);color:var(--sage-deep);flex-shrink:0">✓ Auto</span>
+            </div><div class="rule-row">
+              <div style="display:flex;align-items:center;gap:12px">
+                <span style="font-size:17px;width:24px;text-align:center">🙋</span>
+                <div>
+                  <div style="font-size:13px;font-weight:500;color:var(--charcoal)">New Patient Inquiries</div>
+                  <div style="font-size:11.5px;color:var(--text-muted);margin-top:1px">Welcome + booking information</div>
+                </div>
+              </div>
+              <span class="tag" style="background:var(--sage-pale);color:var(--sage-deep);flex-shrink:0">✓ Auto</span>
+            </div><div class="rule-row">
+              <div style="display:flex;align-items:center;gap:12px">
+                <span style="font-size:17px;width:24px;text-align:center">💳</span>
+                <div>
+                  <div style="font-size:13px;font-weight:500;color:var(--charcoal)">Simple Billing Questions</div>
+                  <div style="font-size:11.5px;color:var(--text-muted);margin-top:1px">Acknowledge + 1-2 day follow-up</div>
+                </div>
+              </div>
+              <span class="tag" style="background:var(--sage-pale);color:var(--sage-deep);flex-shrink:0">✓ Auto</span>
+            </div><div class="rule-row">
+              <div style="display:flex;align-items:center;gap:12px">
+                <span style="font-size:17px;width:24px;text-align:center">👨‍⚕️</span>
+                <div>
+                  <div style="font-size:13px;font-weight:500;color:var(--charcoal)">Doctor Referrals</div>
+                  <div style="font-size:11.5px;color:var(--text-muted);margin-top:1px">Confirm receipt + contact timeline</div>
+                </div>
+              </div>
+              <span class="tag" style="background:var(--sage-pale);color:var(--sage-deep);flex-shrink:0">✓ Auto</span>
+            </div><div class="rule-row">
+              <div style="display:flex;align-items:center;gap:12px">
+                <span style="font-size:17px;width:24px;text-align:center">🏥</span>
+                <div>
+                  <div style="font-size:13px;font-weight:500;color:var(--charcoal)">ICBC Claims</div>
+                  <div style="font-size:11.5px;color:var(--text-muted);margin-top:1px">Always held for staff review</div>
+                </div>
+              </div>
+              <span class="tag" style="background:var(--red-lt);color:var(--red-soft);flex-shrink:0">👁 Review</span>
+            </div><div class="rule-row">
+              <div style="display:flex;align-items:center;gap:12px">
+                <span style="font-size:17px;width:24px;text-align:center">😤</span>
+                <div>
+                  <div style="font-size:13px;font-weight:500;color:var(--charcoal)">Complaints / Anger</div>
+                  <div style="font-size:11.5px;color:var(--text-muted);margin-top:1px">Always held — human touch required</div>
+                </div>
+              </div>
+              <span class="tag" style="background:var(--red-lt);color:var(--red-soft);flex-shrink:0">👁 Review</span>
+            </div><div class="rule-row">
+              <div style="display:flex;align-items:center;gap:12px">
+                <span style="font-size:17px;width:24px;text-align:center">🩺</span>
+                <div>
+                  <div style="font-size:13px;font-weight:500;color:var(--charcoal)">Clinical Questions</div>
+                  <div style="font-size:11.5px;color:var(--text-muted);margin-top:1px">Held — therapist judgment needed</div>
+                </div>
+              </div>
+              <span class="tag" style="background:var(--red-lt);color:var(--red-soft);flex-shrink:0">👁 Review</span>
+            </div><div class="rule-row">
+              <div style="display:flex;align-items:center;gap:12px">
+                <span style="font-size:17px;width:24px;text-align:center">❓</span>
+                <div>
+                  <div style="font-size:13px;font-weight:500;color:var(--charcoal)">Confidence < 80%</div>
+                  <div style="font-size:11.5px;color:var(--text-muted);margin-top:1px">Held — AI not certain enough</div>
+                </div>
+              </div>
+              <span class="tag" style="background:var(--red-lt);color:var(--red-soft);flex-shrink:0">👁 Review</span>
+            </div>
           </div>
 
           <!-- Live log -->
@@ -1671,7 +1720,7 @@ function renderCRM(){
             <div style="font-size:11px;color:var(--stone-lt);margin-top:1px">\${c.email}</div>
           </div>
           <div style="padding:11px 13px;border-bottom:1px solid var(--border-lt);font-size:12.5px;color:var(--text-muted);background:\${rowBg};overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:200px">\${c.lastSubject||'—'}</div>
-          <div style="padding:11px 13px;border-bottom:1px solid var(--border-lt);font-size:12.5px;color:\${isSilent?'var(--amber)':'var(--text-muted)'};font-weight:\${isSilent?600:400};background:\${rowBg}">\${isSilent?'⚠️ ':''}${days}d ago</div>
+          <div style="padding:11px 13px;border-bottom:1px solid var(--border-lt);font-size:12.5px;color:\${isSilent?'var(--amber)':'var(--text-muted)'};font-weight:\${isSilent?600:400};background:\${rowBg}">\${isSilent?'⚠️ ':''}\${days}d ago</div>
           <div style="padding:11px 13px;border-bottom:1px solid var(--border-lt);font-size:12.5px;color:var(--text-muted);background:\${rowBg};text-align:center">\${c.touchCount||1}</div>
           <div style="padding:11px 13px;border-bottom:1px solid var(--border-lt);background:\${rowBg}">
             <span class="tag" style="background:\${st.bg};color:\${st.color}">\${st.label}</span>
